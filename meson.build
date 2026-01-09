@@ -67,10 +67,16 @@ cpp_sources = files(
   'src/sinkhorn/torch_cuda.cpp',
   'src/sinkhorn/torch_cpu.cpp',
   'src/sinkhorn/kernels_cpu.cpp',
+  # Bidirectional Softmax module
+  'src/bidirectional_softmax/registry.cpp',
+  'src/bidirectional_softmax/torch_cuda.cpp',
+  'src/bidirectional_softmax/torch_cpu.cpp',
+  'src/bidirectional_softmax/kernels_cpu.cpp',
 )
 
 cuda_sources = files(
   'src/sinkhorn/kernels.cu',
+  'src/bidirectional_softmax/kernels.cu',
 )
 
 # Build Python extension module
@@ -89,5 +95,6 @@ python.install_sources(
   'dot/__init__.py',
   'dot/_ops.py',
   'dot/sinkhorn.py',
+  'dot/bidirectional_softmax.py',
   subdir : 'dot',
 )

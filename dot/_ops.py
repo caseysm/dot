@@ -69,8 +69,12 @@ _load_extension()
 # Expose the full dot namespace for advanced users
 dot = torch.ops.dot
 
-# Wrapped operator access
+# Wrapped operator access - Sinkhorn
 sinkhorn = torch.ops.dot.sinkhorn
 sinkhorn_log = torch.ops.dot.sinkhorn_log
 sinkhorn_with_grads_unrolled = torch.ops.dot.sinkhorn_with_grads_unrolled
 sinkhorn_with_grads_implicit = torch.ops.dot.sinkhorn_with_grads_implicit
+
+# Wrapped operator access - Bidirectional Softmax
+bidirectional_softmax = torch.ops.dot.bidirectional_softmax
+bidirectional_softmax_backward = torch.ops.dot.bidirectional_softmax_backward
