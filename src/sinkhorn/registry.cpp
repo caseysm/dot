@@ -2,8 +2,14 @@
  * @file registry.cpp
  * @brief Schema definitions for Sinkhorn optimal transport operators
  *
- * Defines the operator schemas (m.def calls) for Sinkhorn algorithm.
+ * Defines the operator schemas for Sinkhorn algorithm.
  * Implementations are registered in torch_cuda.cpp and torch_cpu.cpp.
+ *
+ * API:
+ *   - sinkhorn(log_alpha, tau, n_iters) -> P
+ *   - sinkhorn_log(log_alpha, tau, n_iters) -> log(P)
+ *   - sinkhorn_with_grads_unrolled(log_alpha, grad_P, tau, n_iters) -> [P, grad_log_alpha, grad_tau]
+ *   - sinkhorn_with_grads_implicit(log_alpha, grad_P, tau, n_iters, backward_iters) -> [P, grad_log_alpha, grad_tau]
  */
 
 #include <torch/extension.h>
@@ -15,17 +21,23 @@ TORCH_LIBRARY_FRAGMENT(dot, m) {
     // SINKHORN OPTIMAL TRANSPORT
     // =========================================================================
     //
-    // Entropy-regularized optimal transport using Sinkhorn-Knopp algorithm.
-    //
-    // Given cost matrix C, source distribution a, target distribution b:
-    //   min_P <C, P> - reg * H(P)
-    //   s.t. P @ 1 = a, P^T @ 1 = b, P >= 0
+    // Converts log-space scores to doubly-stochastic matrix (soft permutation).
+    // Input: log_alpha [B, n, n] - logits (use -D/sigma for distance matrix D)
+    // Output: P [B, n, n] - doubly-stochastic soft permutation matrix
 
-    // Forward pass: compute optimal transport plan
-    m.def("sinkhorn_forward(Tensor cost, float reg, int max_iter, float tol, Tensor? a, Tensor? b) -> Tensor[]");
+    // Basic forward: compute doubly-stochastic matrix
+    m.def("sinkhorn(Tensor log_alpha, float tau, int n_iters) -> Tensor");
 
-    // Backward pass: compute gradient w.r.t. cost matrix
-    m.def("sinkhorn_backward(Tensor grad_output, Tensor cost, Tensor transport, float reg) -> Tensor");
+    // Log-space forward: return log(P) for numerical stability
+    m.def("sinkhorn_log(Tensor log_alpha, float tau, int n_iters) -> Tensor");
+
+    // Forward + backward with unrolled differentiation through iterations
+    // Returns [P, grad_log_alpha, grad_tau]
+    m.def("sinkhorn_with_grads_unrolled(Tensor log_alpha, Tensor grad_P, float tau, int n_iters) -> Tensor[]");
+
+    // Forward + backward with implicit differentiation (memory efficient)
+    // Returns [P, grad_log_alpha, grad_tau]
+    m.def("sinkhorn_with_grads_implicit(Tensor log_alpha, Tensor grad_P, float tau, int n_iters, int backward_iters) -> Tensor[]");
 }
 
 #endif // USE_TORCH_LIBRARY

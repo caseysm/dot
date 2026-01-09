@@ -8,7 +8,18 @@ Usage:
     from dot import _ops
 
     # Direct operator access
-    transport = _ops.sinkhorn_forward(cost, reg, max_iter, lengths)
+    P = _ops.sinkhorn(log_alpha, tau=1.0, n_iters=20)
+    log_P = _ops.sinkhorn_log(log_alpha, tau=1.0, n_iters=20)
+
+    # Forward + backward (unrolled)
+    P, grad_log_alpha, grad_tau = _ops.sinkhorn_with_grads_unrolled(
+        log_alpha, grad_P, tau=1.0, n_iters=20
+    )
+
+    # Forward + backward (implicit, memory efficient)
+    P, grad_log_alpha, grad_tau = _ops.sinkhorn_with_grads_implicit(
+        log_alpha, grad_P, tau=1.0, n_iters=20, backward_iters=20
+    )
 """
 
 import os
@@ -59,5 +70,7 @@ _load_extension()
 dot = torch.ops.dot
 
 # Wrapped operator access
-sinkhorn_forward = torch.ops.dot.sinkhorn_forward
-sinkhorn_backward = torch.ops.dot.sinkhorn_backward
+sinkhorn = torch.ops.dot.sinkhorn
+sinkhorn_log = torch.ops.dot.sinkhorn_log
+sinkhorn_with_grads_unrolled = torch.ops.dot.sinkhorn_with_grads_unrolled
+sinkhorn_with_grads_implicit = torch.ops.dot.sinkhorn_with_grads_implicit
