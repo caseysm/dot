@@ -1,0 +1,54 @@
+[build-system]
+# Build dependencies - only needed when building from source, not when installing wheels
+requires = [
+    "meson-python>=0.15.0",
+    "meson>=1.2.0",
+    "ninja",
+    "torch>=2.0.0",  # Needed at build time to find PyTorch includes
+]
+build-backend = "mesonpy"
+
+[project]
+name = "dot"
+version = "0.1.0"
+description = "Differentiable Optimal Transport operators for PyTorch"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+keywords = ["pytorch", "optimal-transport", "differentiable", "cuda", "sinkhorn", "wasserstein"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-xdist",
+]
+
+[project.urls]
+Repository = "https://github.com/yourusername/dot"
+
+[tool.meson-python.args]
+setup = ["-Dbuildtype=release"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
