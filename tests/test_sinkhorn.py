@@ -397,27 +397,27 @@ def test_composed_gradient_through_points_and_reg():
     assert eps.grad is not None
 
 
-def test_overrelaxed_matches_vanilla():
+def test_momentum_matches_vanilla():
     import dot
 
     cost = torch.rand(1, 12, 12)
     vanilla = dot.sinkhorn(cost, reg=1.0, n_iters=80)
-    overrelaxed = dot.sinkhorn(cost, reg=1.0, n_iters=80, method="overrelaxed", omega=1.5)
+    momentum = dot.sinkhorn(cost, reg=1.0, n_iters=80, method="momentum", omega=1.5)
 
-    assert torch.allclose(vanilla.transport_plan, overrelaxed.transport_plan, atol=1e-4)
+    assert torch.allclose(vanilla.transport_plan, momentum.transport_plan, atol=1e-4)
 
 
-def test_overrelaxed_auto_omega_runs():
+def test_momentum_auto_omega_runs():
     import dot
 
     cost = torch.rand(1, 12, 12)
-    result = dot.sinkhorn(cost, reg=0.1, n_iters=80, method="overrelaxed")
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=80, method="momentum")
 
     assert result.transport_plan.shape == (1, 12, 12)
     assert result.n_iters_used is not None
 
 
-def test_overrelaxed_uses_fewer_iterations_than_vanilla():
+def test_momentum_uses_fewer_iterations_than_vanilla():
     import dot
 
     n = 32
@@ -425,10 +425,10 @@ def test_overrelaxed_uses_fewer_iterations_than_vanilla():
     cost = (grid[:, None] - grid[None, :]).abs().pow(2).unsqueeze(0)
     tau = 0.02
     vanilla_iters = _vanilla_convergence_iters(-cost, tau=tau, max_iters=120)
-    overrelaxed = dot.sinkhorn(cost, reg=tau, n_iters=120, method="overrelaxed", omega=1.4)
+    momentum = dot.sinkhorn(cost, reg=tau, n_iters=120, method="momentum", omega=1.4)
 
-    assert overrelaxed.n_iters_used is not None
-    assert overrelaxed.n_iters_used < vanilla_iters
+    assert momentum.n_iters_used is not None
+    assert momentum.n_iters_used < vanilla_iters
 
 
 def test_anderson_matches_vanilla():
@@ -484,9 +484,10 @@ def test_anderson_falls_back_when_solve_fails():
     assert torch.allclose(vanilla.transport_plan, anderson.transport_plan, atol=1e-4)
 
 
-def test_adam_matches_vanilla():
+def test_adam_matches_vanilla_on_well_conditioned_problem():
     import dot
 
+    torch.manual_seed(0)
     cost = torch.rand(1, 12, 12)
     vanilla = dot.sinkhorn(cost, reg=0.1, n_iters=200)
     adam = dot.sinkhorn(cost, reg=0.1, n_iters=200, method="adam", lr=0.5)
@@ -506,6 +507,56 @@ def test_adam_handles_nonuniform_costs():
     assert result.n_iters_used is not None
 
 
+def test_adam_rmsprop_regime_can_beat_vanilla():
+    import dot
+
+    n = 32
+    grid = torch.linspace(-3.0, 3.0, n)
+    cost = ((grid[:, None] - grid[None, :]).abs().pow(2) * torch.linspace(1.0, 5.0, n).unsqueeze(0)).unsqueeze(0)
+    tau = 0.02
+    ref = dot.sinkhorn(cost, reg=tau, n_iters=800)
+    vanilla = dot.sinkhorn(cost, reg=tau, n_iters=20)
+    rmsprop_like = dot.sinkhorn(
+        cost,
+        reg=tau,
+        n_iters=20,
+        method="adam",
+        lr=0.25,
+        beta1=0.0,
+        beta2=0.999,
+        bias_correction=False,
+    )
+
+    vanilla_err = (vanilla.transport_plan - ref.transport_plan).abs().mean()
+    rmsprop_err = (rmsprop_like.transport_plan - ref.transport_plan).abs().mean()
+    assert rmsprop_err < vanilla_err
+
+
+def test_adam_bias_correction_can_hurt_deterministic_residuals():
+    import dot
+
+    n = 32
+    grid = torch.linspace(-3.0, 3.0, n)
+    cost = ((grid[:, None] - grid[None, :]).abs().pow(2) * torch.linspace(1.0, 5.0, n).unsqueeze(0)).unsqueeze(0)
+    tau = 0.02
+    ref = dot.sinkhorn(cost, reg=tau, n_iters=800)
+    adam_default = dot.sinkhorn(cost, reg=tau, n_iters=20, method="adam", lr=0.5)
+    rmsprop_like = dot.sinkhorn(
+        cost,
+        reg=tau,
+        n_iters=20,
+        method="adam",
+        lr=0.25,
+        beta1=0.0,
+        beta2=0.999,
+        bias_correction=False,
+    )
+
+    default_err = (adam_default.transport_plan - ref.transport_plan).abs().mean()
+    rmsprop_err = (rmsprop_like.transport_plan - ref.transport_plan).abs().mean()
+    assert rmsprop_err < default_err
+
+
 def test_adam_backward_works():
     import dot
 
@@ -516,17 +567,17 @@ def test_adam_backward_works():
     assert cost.grad is not None
 
 
-def test_annealed_matches_vanilla():
+def test_scheduled_vanilla_matches_unscheduled_when_reg_start_equals_target():
     import dot
 
     cost = torch.rand(1, 12, 12)
     vanilla = dot.sinkhorn(cost, reg=0.1, n_iters=200)
-    annealed = dot.sinkhorn(cost, reg=0.1, n_iters=200, method="annealed")
+    scheduled = dot.sinkhorn(cost, reg=0.1, n_iters=200, schedule="cosine", reg_start=0.1)
 
-    assert torch.allclose(vanilla.transport_plan, annealed.transport_plan, atol=1e-4)
+    assert torch.allclose(vanilla.transport_plan, scheduled.transport_plan, atol=1e-4)
 
 
-def test_annealed_handles_small_epsilon_better_than_vanilla():
+def test_scheduled_vanilla_handles_small_epsilon_better_than_vanilla():
     import dot
 
     n = 24
@@ -536,21 +587,108 @@ def test_annealed_handles_small_epsilon_better_than_vanilla():
     tau = 0.001
     ref = dot.sinkhorn(cost, reg=tau, n_iters=600)
     vanilla = dot.sinkhorn(cost, reg=tau, n_iters=10)
-    annealed = dot.sinkhorn(cost, reg=tau, n_iters=10, method="annealed", reg_start=0.1, schedule="linear")
+    scheduled = dot.sinkhorn(cost, reg=tau, n_iters=10, schedule="linear", reg_start=0.1)
 
     vanilla_err = (vanilla.transport_plan - ref.transport_plan).abs().mean()
-    annealed_err = (annealed.transport_plan - ref.transport_plan).abs().mean()
-    assert annealed_err < vanilla_err
+    scheduled_err = (scheduled.transport_plan - ref.transport_plan).abs().mean()
+    assert scheduled_err < vanilla_err
 
 
-def test_annealed_backward_works():
+def test_scheduled_vanilla_backward_works():
     import dot
 
     cost = torch.rand(1, 10, 10, requires_grad=True)
-    result = dot.sinkhorn(cost, reg=0.01, n_iters=80, method="annealed", reg_start=0.1)
+    result = dot.sinkhorn(cost, reg=0.01, n_iters=80, schedule="cosine", reg_start=0.1)
     result.cost.sum().backward()
 
     assert cost.grad is not None
+
+
+def test_scheduled_anderson_matches_unscheduled_when_reg_start_equals_target():
+    import dot
+
+    cost = torch.rand(1, 12, 12)
+    anderson = dot.sinkhorn(cost, reg=0.1, n_iters=120, method="anderson", anderson_k=5)
+    scheduled = dot.sinkhorn(
+        cost,
+        reg=0.1,
+        n_iters=120,
+        method="anderson",
+        anderson_k=5,
+        schedule="cosine",
+        reg_start=0.1,
+    )
+
+    assert torch.allclose(anderson.transport_plan, scheduled.transport_plan, atol=1e-4)
+
+
+def test_scheduled_anderson_works():
+    import dot
+
+    cost = torch.rand(1, 12, 12, requires_grad=True)
+    result = dot.sinkhorn(cost, reg=0.01, n_iters=80, method="anderson", schedule="cosine", reg_start=0.1)
+    result.cost.sum().backward()
+
+    assert cost.grad is not None
+
+
+@pytest.mark.parametrize("n", [5, 10, 20])
+def test_newton_matches_vanilla_on_small_problems(n: int):
+    import dot
+
+    torch.manual_seed(n)
+    cost = torch.rand(1, n, n)
+    vanilla = dot.sinkhorn(cost, reg=0.1, n_iters=200)
+    newton = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="newton")
+
+    assert torch.allclose(vanilla.transport_plan, newton.transport_plan, atol=1e-5)
+
+
+def test_newton_converges_in_few_iterations():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 20, 20)
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="newton")
+
+    assert result.n_iters_used is not None
+    assert result.n_iters_used <= 5
+
+
+def test_newton_supports_explicit_marginals():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 12, 9)
+    a = torch.rand(12)
+    a = a / a.sum()
+    b = torch.rand(9)
+    b = b / b.sum()
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="newton", a=a, b=b)
+
+    assert torch.allclose(result.transport_plan.sum(dim=-1).squeeze(0), a, atol=1e-5)
+    assert torch.allclose(result.transport_plan.sum(dim=-2).squeeze(0), b, atol=1e-5)
+
+
+def test_newton_backward_works():
+    import dot
+
+    cost = torch.rand(1, 10, 10, requires_grad=True)
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="newton")
+    result.cost.sum().backward()
+
+    assert cost.grad is not None
+
+
+def test_auto_dispatch_selects_newton_for_small_problems():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 11, 11)
+    auto = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="auto")
+    newton = dot.sinkhorn(cost, reg=0.1, n_iters=5, method="newton")
+
+    assert torch.allclose(auto.transport_plan, newton.transport_plan, atol=1e-6)
 
 
 def test_muon_matches_vanilla():

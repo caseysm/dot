@@ -279,12 +279,14 @@ void sinkhorn_backward_implicit_cpu(
             for (int i = 0; i < n; ++i) {
                 float sum_PG = 0.0f;
                 float sum_P_mu = 0.0f;
+                float sum_P = 0.0f;
                 for (int k = 0; k < m; ++k) {
                     float p_ik = P_b[i * m + k];
                     sum_PG += p_ik * G[i * m + k];
                     sum_P_mu += p_ik * mu[k];
+                    sum_P += p_ik;
                 }
-                float new_lambda = sum_PG - sum_P_mu;
+                float new_lambda = (sum_PG - sum_P_mu) / std::max(sum_P, 1.0e-12f);
                 max_change = std::max(max_change, std::abs(new_lambda - lambda_[i]));
                 lambda_[i] = new_lambda;
             }
@@ -292,12 +294,14 @@ void sinkhorn_backward_implicit_cpu(
             for (int k = 0; k < m; ++k) {
                 float sum_PG = 0.0f;
                 float sum_P_lambda = 0.0f;
+                float sum_P = 0.0f;
                 for (int i = 0; i < n; ++i) {
                     float p_ik = P_b[i * m + k];
                     sum_PG += p_ik * G[i * m + k];
                     sum_P_lambda += p_ik * lambda_[i];
+                    sum_P += p_ik;
                 }
-                float new_mu = sum_PG - sum_P_lambda;
+                float new_mu = (sum_PG - sum_P_lambda) / std::max(sum_P, 1.0e-12f);
                 max_change = std::max(max_change, std::abs(new_mu - mu[k]));
                 mu[k] = new_mu;
             }

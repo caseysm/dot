@@ -324,18 +324,22 @@ __global__ void sinkhorn_implicit_update_lambda_kernel(
 
     float sum_PG = 0.0f;
     float sum_P_mu = 0.0f;
+    float sum_P = 0.0f;
     for (int k = threadIdx.x; k < m; k += blockDim.x) {
         float p_ik = P_b[i * m + k];
         sum_PG += p_ik * G_b[i * m + k];
         sum_P_mu += p_ik * mu_b[k];
+        sum_P += p_ik;
     }
 
     float block_sum_PG = block_reduce_sum(sum_PG, shared);
     __syncthreads();
     float block_sum_P_mu = block_reduce_sum(sum_P_mu, shared);
+    __syncthreads();
+    float block_sum_P = block_reduce_sum(sum_P, shared);
 
     if (threadIdx.x == 0) {
-        lambda_b[i] = block_sum_PG - block_sum_P_mu;
+        lambda_b[i] = (block_sum_PG - block_sum_P_mu) / fmaxf(block_sum_P, 1.0e-12f);
     }
 }
 
@@ -362,18 +366,22 @@ __global__ void sinkhorn_implicit_update_mu_kernel(
 
     float sum_PG = 0.0f;
     float sum_P_lambda = 0.0f;
+    float sum_P = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float p_ik = P_b[i * m + k];
         sum_PG += p_ik * G_b[i * m + k];
         sum_P_lambda += p_ik * lambda_b[i];
+        sum_P += p_ik;
     }
 
     float block_sum_PG = block_reduce_sum(sum_PG, shared);
     __syncthreads();
     float block_sum_P_lambda = block_reduce_sum(sum_P_lambda, shared);
+    __syncthreads();
+    float block_sum_P = block_reduce_sum(sum_P, shared);
 
     if (threadIdx.x == 0) {
-        mu_b[k] = block_sum_PG - block_sum_P_lambda;
+        mu_b[k] = (block_sum_PG - block_sum_P_lambda) / fmaxf(block_sum_P, 1.0e-12f);
     }
 }
 
