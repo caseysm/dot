@@ -21,23 +21,23 @@ TORCH_LIBRARY_FRAGMENT(dot, m) {
     // SINKHORN OPTIMAL TRANSPORT
     // =========================================================================
     //
-    // Converts log-space scores to doubly-stochastic matrix (soft permutation).
-    // Input: log_alpha [B, n, n] - logits (use -D/sigma for distance matrix D)
-    // Output: P [B, n, n] - doubly-stochastic soft permutation matrix
+    // Converts log-space scores to transport plan / soft permutation.
+    // Input: log_alpha [B, n, m] - logits (use -D/sigma for distance matrix D)
+    // Output: P [B, n, m] - normalized transport plan
 
     // Basic forward: compute doubly-stochastic matrix
-    m.def("sinkhorn(Tensor log_alpha, float tau, int n_iters) -> Tensor");
+    m.def("sinkhorn(Tensor log_alpha, float tau, int n_iters, Tensor? log_a=None, Tensor? log_b=None) -> Tensor");
 
     // Log-space forward: return log(P) for numerical stability
-    m.def("sinkhorn_log(Tensor log_alpha, float tau, int n_iters) -> Tensor");
+    m.def("sinkhorn_log(Tensor log_alpha, float tau, int n_iters, Tensor? log_a=None, Tensor? log_b=None) -> Tensor");
 
     // Forward + backward with unrolled differentiation through iterations
     // Returns [P, grad_log_alpha, grad_tau]
-    m.def("sinkhorn_with_grads_unrolled(Tensor log_alpha, Tensor grad_P, float tau, int n_iters) -> Tensor[]");
+    m.def("sinkhorn_with_grads_unrolled(Tensor log_alpha, Tensor grad_P, float tau, int n_iters, Tensor? log_a=None, Tensor? log_b=None) -> Tensor[]");
 
     // Forward + backward with implicit differentiation (memory efficient)
     // Returns [P, grad_log_alpha, grad_tau]
-    m.def("sinkhorn_with_grads_implicit(Tensor log_alpha, Tensor grad_P, float tau, int n_iters, int backward_iters) -> Tensor[]");
+    m.def("sinkhorn_with_grads_implicit(Tensor log_alpha, Tensor grad_P, float tau, int n_iters, int backward_iters, Tensor? log_a=None, Tensor? log_b=None) -> Tensor[]");
 }
 
 #endif // USE_TORCH_LIBRARY

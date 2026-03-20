@@ -24,27 +24,41 @@ namespace {
 torch::Tensor sinkhorn_cuda_impl(
     torch::Tensor log_alpha,
     double tau,
-    int64_t n_iters
+    int64_t n_iters,
+    c10::optional<torch::Tensor> log_a,
+    c10::optional<torch::Tensor> log_b
 ) {
     DOT_CHECK_INPUT_CUDA(log_alpha);
-    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, n]");
-    TORCH_CHECK(log_alpha.size(1) == log_alpha.size(2), "log_alpha must be square");
+    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, m]");
     TORCH_CHECK(tau > 0.0, "tau must be > 0");
     TORCH_CHECK(n_iters >= 0, "n_iters must be >= 0");
 
     int B = log_alpha.size(0);
     int n = log_alpha.size(1);
+    int m = log_alpha.size(2);
+    if (log_a.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_a);
+        TORCH_CHECK(log_a->dim() == 2 && log_a->size(0) == B && log_a->size(1) == n, "log_a must have shape [B, n]");
+    }
+    if (log_b.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_b);
+        TORCH_CHECK(log_b->dim() == 2 && log_b->size(0) == B && log_b->size(1) == m, "log_b must have shape [B, m]");
+    }
 
     auto options = log_alpha.options().dtype(torch::kFloat32);
-    torch::Tensor P = torch::empty({B, n, n}, options);
+    torch::Tensor P = torch::empty({B, n, m}, options);
 
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
+    torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
+    torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     dot::sinkhorn::sinkhorn_forward_cuda(
         log_alpha_f.data_ptr<float>(),
         P.data_ptr<float>(),
-        B, n,
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/false,
@@ -57,27 +71,41 @@ torch::Tensor sinkhorn_cuda_impl(
 torch::Tensor sinkhorn_log_cuda_impl(
     torch::Tensor log_alpha,
     double tau,
-    int64_t n_iters
+    int64_t n_iters,
+    c10::optional<torch::Tensor> log_a,
+    c10::optional<torch::Tensor> log_b
 ) {
     DOT_CHECK_INPUT_CUDA(log_alpha);
-    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, n]");
-    TORCH_CHECK(log_alpha.size(1) == log_alpha.size(2), "log_alpha must be square");
+    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, m]");
     TORCH_CHECK(tau > 0.0, "tau must be > 0");
     TORCH_CHECK(n_iters >= 0, "n_iters must be >= 0");
 
     int B = log_alpha.size(0);
     int n = log_alpha.size(1);
+    int m = log_alpha.size(2);
+    if (log_a.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_a);
+        TORCH_CHECK(log_a->dim() == 2 && log_a->size(0) == B && log_a->size(1) == n, "log_a must have shape [B, n]");
+    }
+    if (log_b.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_b);
+        TORCH_CHECK(log_b->dim() == 2 && log_b->size(0) == B && log_b->size(1) == m, "log_b must have shape [B, m]");
+    }
 
     auto options = log_alpha.options().dtype(torch::kFloat32);
-    torch::Tensor log_P = torch::empty({B, n, n}, options);
+    torch::Tensor log_P = torch::empty({B, n, m}, options);
 
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
+    torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
+    torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     dot::sinkhorn::sinkhorn_forward_cuda(
         log_alpha_f.data_ptr<float>(),
         log_P.data_ptr<float>(),
-        B, n,
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/true,
@@ -91,30 +119,42 @@ std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cuda_impl(
     torch::Tensor log_alpha,
     torch::Tensor grad_P,
     double tau,
-    int64_t n_iters
+    int64_t n_iters,
+    c10::optional<torch::Tensor> log_a,
+    c10::optional<torch::Tensor> log_b
 ) {
     DOT_CHECK_INPUT_CUDA(log_alpha);
     DOT_CHECK_INPUT_CUDA(grad_P);
-    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, n]");
-    TORCH_CHECK(log_alpha.size(1) == log_alpha.size(2), "log_alpha must be square");
+    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, m]");
     TORCH_CHECK(grad_P.sizes() == log_alpha.sizes(), "grad_P must match log_alpha shape");
     TORCH_CHECK(tau > 0.0, "tau must be > 0");
     TORCH_CHECK(n_iters >= 0, "n_iters must be >= 0");
 
     int B = log_alpha.size(0);
     int n = log_alpha.size(1);
+    int m = log_alpha.size(2);
+    if (log_a.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_a);
+        TORCH_CHECK(log_a->dim() == 2 && log_a->size(0) == B && log_a->size(1) == n, "log_a must have shape [B, n]");
+    }
+    if (log_b.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_b);
+        TORCH_CHECK(log_b->dim() == 2 && log_b->size(0) == B && log_b->size(1) == m, "log_b must have shape [B, m]");
+    }
 
     auto options = log_alpha.options().dtype(torch::kFloat32);
-    torch::Tensor P = torch::empty({B, n, n}, options);
-    torch::Tensor grad_log_alpha = torch::empty({B, n, n}, options);
+    torch::Tensor P = torch::empty({B, n, m}, options);
+    torch::Tensor grad_log_alpha = torch::empty({B, n, m}, options);
     torch::Tensor grad_tau_tensor = torch::empty({B}, options);
 
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
     torch::Tensor grad_P_f = grad_P.to(torch::kFloat32).contiguous();
+    torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
+    torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
 
     // Allocate intermediates
-    torch::Tensor log_X = torch::empty({B, n_iters + 1, n, n}, options);
-    torch::Tensor log_Y = torch::empty({B, n_iters, n, n}, options);
+    torch::Tensor log_X = torch::empty({B, n_iters + 1, n, m}, options);
+    torch::Tensor log_Y = torch::empty({B, n_iters, n, m}, options);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -124,7 +164,9 @@ std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cuda_impl(
         P.data_ptr<float>(),
         log_X.data_ptr<float>(),
         log_Y.data_ptr<float>(),
-        B, n,
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         stream
@@ -137,9 +179,11 @@ std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cuda_impl(
         grad_P_f.data_ptr<float>(),
         log_X.data_ptr<float>(),
         log_Y.data_ptr<float>(),
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
         grad_log_alpha.data_ptr<float>(),
         grad_tau_tensor.data_ptr<float>(),
-        B, n,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         stream
@@ -153,12 +197,13 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
     torch::Tensor grad_P,
     double tau,
     int64_t n_iters,
-    int64_t backward_iters
+    int64_t backward_iters,
+    c10::optional<torch::Tensor> log_a,
+    c10::optional<torch::Tensor> log_b
 ) {
     DOT_CHECK_INPUT_CUDA(log_alpha);
     DOT_CHECK_INPUT_CUDA(grad_P);
-    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, n]");
-    TORCH_CHECK(log_alpha.size(1) == log_alpha.size(2), "log_alpha must be square");
+    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, m]");
     TORCH_CHECK(grad_P.sizes() == log_alpha.sizes(), "grad_P must match log_alpha shape");
     TORCH_CHECK(tau > 0.0, "tau must be > 0");
     TORCH_CHECK(n_iters >= 0, "n_iters must be >= 0");
@@ -166,14 +211,25 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
 
     int B = log_alpha.size(0);
     int n = log_alpha.size(1);
+    int m = log_alpha.size(2);
+    if (log_a.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_a);
+        TORCH_CHECK(log_a->dim() == 2 && log_a->size(0) == B && log_a->size(1) == n, "log_a must have shape [B, n]");
+    }
+    if (log_b.has_value()) {
+        DOT_CHECK_INPUT_CUDA(*log_b);
+        TORCH_CHECK(log_b->dim() == 2 && log_b->size(0) == B && log_b->size(1) == m, "log_b must have shape [B, m]");
+    }
 
     auto options = log_alpha.options().dtype(torch::kFloat32);
-    torch::Tensor P = torch::empty({B, n, n}, options);
-    torch::Tensor grad_log_alpha = torch::empty({B, n, n}, options);
+    torch::Tensor P = torch::empty({B, n, m}, options);
+    torch::Tensor grad_log_alpha = torch::empty({B, n, m}, options);
     torch::Tensor grad_tau_tensor = torch::empty({B}, options);
 
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
     torch::Tensor grad_P_f = grad_P.to(torch::kFloat32).contiguous();
+    torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
+    torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -181,7 +237,9 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
     dot::sinkhorn::sinkhorn_forward_cuda(
         log_alpha_f.data_ptr<float>(),
         P.data_ptr<float>(),
-        B, n,
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/false,
@@ -193,9 +251,11 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
         log_alpha_f.data_ptr<float>(),
         P.data_ptr<float>(),
         grad_P_f.data_ptr<float>(),
+        log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
+        log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
         grad_log_alpha.data_ptr<float>(),
         grad_tau_tensor.data_ptr<float>(),
-        B, n,
+        B, n, m,
         static_cast<float>(tau),
         static_cast<int>(backward_iters),
         stream

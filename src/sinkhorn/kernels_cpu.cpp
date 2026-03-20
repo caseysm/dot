@@ -3,29 +3,17 @@
  * @brief Sinkhorn CPU Kernels
  *
  * Raw C++ implementation of Sinkhorn-Knopp algorithm with backward passes.
- * Converts log-space scores to doubly-stochastic matrix (soft permutation).
- *
- * Input:  log_alpha [B, n, n] - logits (use -D/sigma for distance matrix D)
- * Output: P [B, n, n] - doubly-stochastic soft permutation matrix
- *
- * Two backward pass implementations:
- * 1. Unrolled: Differentiate through T iterations explicitly (exact for finite T)
- * 2. Implicit: Use implicit function theorem at convergence (memory efficient)
  */
 
 #include "kernels_cpu.h"
-#include <cmath>
-#include <cfloat>
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
 namespace dot {
 namespace sinkhorn {
-
-// =============================================================================
-// Numerical Stability Helpers
-// =============================================================================
 
 inline float safe_exp(float x) {
     if (x < -88.0f) return 0.0f;
@@ -33,7 +21,6 @@ inline float safe_exp(float x) {
     return std::exp(x);
 }
 
-// Kahan compensated summation for better precision
 struct KahanAccumulator {
     float sum = 0.0f;
     float c = 0.0f;
@@ -46,12 +33,7 @@ struct KahanAccumulator {
     }
 
     float result() const { return sum; }
-    void reset() { sum = 0.0f; c = 0.0f; }
 };
-
-// =============================================================================
-// Helper: logsumexp for a row/column with corner case handling
-// =============================================================================
 
 static inline float logsumexp(const float* x, int n, int stride) {
     float max_val = -FLT_MAX;
@@ -75,128 +57,114 @@ static inline float logsumexp(const float* x, int n, int stride) {
     return max_val + std::log(sum.result());
 }
 
-// =============================================================================
-// Sinkhorn Forward (CPU) - Basic version without storing intermediates
-// =============================================================================
-
 void sinkhorn_forward_cpu(
     const float* log_alpha,
     float* log_P,
-    int B, int n,
+    const float* log_a,
+    const float* log_b,
+    int B, int n, int m,
     float tau,
     int n_iters,
     bool return_log
 ) {
     if (tau <= 0.0f) return;
 
-    const int n2 = n * n;
+    const int nm = n * m;
 
     for (int b = 0; b < B; ++b) {
-        const float* in_b = log_alpha + b * n2;
-        float* out_b = log_P + b * n2;
+        const float* in_b = log_alpha + b * nm;
+        float* out_b = log_P + b * nm;
 
-        // Initialize: scale by temperature
-        for (int i = 0; i < n2; ++i) {
-            out_b[i] = in_b[i] / tau;
+        for (int idx = 0; idx < nm; ++idx) {
+            out_b[idx] = in_b[idx] / tau;
         }
 
-        // Sinkhorn iterations
         for (int iter = 0; iter < n_iters; ++iter) {
-            // Row normalization
             for (int i = 0; i < n; ++i) {
-                float* row = out_b + i * n;
-                float lse = logsumexp(row, n, 1);
-                for (int j = 0; j < n; ++j) {
-                    row[j] -= lse;
+                float* row = out_b + i * m;
+                float lse = logsumexp(row, m, 1);
+                float target = log_a != nullptr ? log_a[b * n + i] : -std::log(static_cast<float>(n));
+                for (int j = 0; j < m; ++j) {
+                    row[j] -= (lse - target);
                 }
             }
 
-            // Column normalization
-            for (int j = 0; j < n; ++j) {
-                float lse = logsumexp(out_b + j, n, n);
+            for (int j = 0; j < m; ++j) {
+                float lse = logsumexp(out_b + j, n, m);
+                float target = log_b != nullptr ? log_b[b * m + j] : -std::log(static_cast<float>(m));
                 for (int i = 0; i < n; ++i) {
-                    out_b[i * n + j] -= lse;
+                    out_b[i * m + j] -= (lse - target);
                 }
             }
         }
 
-        // Convert to probability if needed
         if (!return_log) {
-            for (int i = 0; i < n2; ++i) {
-                out_b[i] = safe_exp(out_b[i]);
+            for (int idx = 0; idx < nm; ++idx) {
+                out_b[idx] = safe_exp(out_b[idx]);
             }
         }
     }
 }
-
-// =============================================================================
-// Sinkhorn Forward with Intermediates (for Unrolled Backward)
-// =============================================================================
 
 void sinkhorn_forward_with_intermediates_cpu(
     const float* log_alpha,
     float* P,
     float* log_X,
     float* log_Y,
-    int B, int n,
+    const float* log_a,
+    const float* log_b,
+    int B, int n, int m,
     float tau,
     int n_iters
 ) {
     if (tau <= 0.0f) return;
 
-    const int n2 = n * n;
+    const int nm = n * m;
 
     for (int b = 0; b < B; ++b) {
-        const float* in_b = log_alpha + b * n2;
-        float* P_b = P + b * n2;
-        float* log_X_b = log_X + b * (n_iters + 1) * n2;
-        float* log_Y_b = log_Y + b * n_iters * n2;
+        const float* in_b = log_alpha + b * nm;
+        float* P_b = P + b * nm;
+        float* log_X_b = log_X + b * (n_iters + 1) * nm;
+        float* log_Y_b = log_Y + b * n_iters * nm;
 
-        // Initialize X^(0) = log_alpha / tau
         float* X0 = log_X_b;
-        for (int i = 0; i < n2; ++i) {
-            X0[i] = in_b[i] / tau;
+        for (int idx = 0; idx < nm; ++idx) {
+            X0[idx] = in_b[idx] / tau;
         }
 
-        // Sinkhorn iterations
         for (int t = 0; t < n_iters; ++t) {
-            float* X_t = log_X_b + t * n2;
-            float* Y_t = log_Y_b + t * n2;
-            float* X_t1 = log_X_b + (t + 1) * n2;
+            float* X_t = log_X_b + t * nm;
+            float* Y_t = log_Y_b + t * nm;
+            float* X_t1 = log_X_b + (t + 1) * nm;
 
-            std::memcpy(Y_t, X_t, n2 * sizeof(float));
+            std::memcpy(Y_t, X_t, nm * sizeof(float));
 
-            // Row normalization
             for (int i = 0; i < n; ++i) {
-                float* row = Y_t + i * n;
-                float lse = logsumexp(row, n, 1);
-                for (int j = 0; j < n; ++j) {
-                    row[j] -= lse;
+                float* row = Y_t + i * m;
+                float lse = logsumexp(row, m, 1);
+                float target = log_a != nullptr ? log_a[b * n + i] : -std::log(static_cast<float>(n));
+                for (int j = 0; j < m; ++j) {
+                    row[j] -= (lse - target);
                 }
             }
 
-            std::memcpy(X_t1, Y_t, n2 * sizeof(float));
+            std::memcpy(X_t1, Y_t, nm * sizeof(float));
 
-            // Column normalization
-            for (int j = 0; j < n; ++j) {
-                float lse = logsumexp(X_t1 + j, n, n);
+            for (int j = 0; j < m; ++j) {
+                float lse = logsumexp(X_t1 + j, n, m);
+                float target = log_b != nullptr ? log_b[b * m + j] : -std::log(static_cast<float>(m));
                 for (int i = 0; i < n; ++i) {
-                    X_t1[i * n + j] -= lse;
+                    X_t1[i * m + j] -= (lse - target);
                 }
             }
         }
 
-        // P = exp(X^(T))
-        float* X_T = log_X_b + n_iters * n2;
-        for (int i = 0; i < n2; ++i) {
-            P_b[i] = safe_exp(X_T[i]);
+        float* X_T = log_X_b + n_iters * nm;
+        for (int idx = 0; idx < nm; ++idx) {
+            P_b[idx] = safe_exp(X_T[idx]);
         }
     }
 }
-
-// =============================================================================
-// Sinkhorn Unrolled Backward (CPU)
-// =============================================================================
 
 void sinkhorn_backward_unrolled_cpu(
     const float* log_alpha,
@@ -204,124 +172,116 @@ void sinkhorn_backward_unrolled_cpu(
     const float* grad_P,
     const float* log_X,
     const float* log_Y,
+    const float* log_a,
+    const float* log_b,
     float* grad_log_alpha,
     float* grad_tau,
-    int B, int n,
+    int B, int n, int m,
     float tau,
     int n_iters
 ) {
-    const int n2 = n * n;
+    const int nm = n * m;
 
-    std::vector<float> Gamma(n2);
-    std::vector<float> Gamma_Y(n2);
-    std::vector<float> q(n2);
-    std::vector<float> p(n2);
+    std::vector<float> Gamma(nm);
+    std::vector<float> Gamma_Y(nm);
+    std::vector<float> q(nm);
+    std::vector<float> p(nm);
 
     for (int b = 0; b < B; ++b) {
-        const float* log_alpha_b = log_alpha + b * n2;
-        const float* P_b = P + b * n2;
-        const float* grad_P_b = grad_P + b * n2;
-        const float* log_X_b = log_X + b * (n_iters + 1) * n2;
-        const float* log_Y_b = log_Y + b * n_iters * n2;
-        float* grad_out_b = grad_log_alpha + b * n2;
+        const float* log_alpha_b = log_alpha + b * nm;
+        const float* P_b = P + b * nm;
+        const float* grad_P_b = grad_P + b * nm;
+        const float* log_X_b = log_X + b * (n_iters + 1) * nm;
+        const float* log_Y_b = log_Y + b * n_iters * nm;
+        float* grad_out_b = grad_log_alpha + b * nm;
 
-        // Initialize: Gamma^(T) = grad_P * P
-        for (int i = 0; i < n2; ++i) {
-            Gamma[i] = grad_P_b[i] * P_b[i];
+        for (int idx = 0; idx < nm; ++idx) {
+            Gamma[idx] = grad_P_b[idx] * P_b[idx];
         }
 
-        // Backprop through iterations
         for (int t = n_iters - 1; t >= 0; --t) {
-            const float* X_t1 = log_X_b + (t + 1) * n2;
-            const float* Y_t = log_Y_b + t * n2;
+            const float* X_t1 = log_X_b + (t + 1) * nm;
+            const float* Y_t = log_Y_b + t * nm;
 
-            // Column backward
-            for (int i = 0; i < n2; ++i) {
-                q[i] = safe_exp(X_t1[i]);
+            for (int idx = 0; idx < nm; ++idx) {
+                q[idx] = safe_exp(X_t1[idx]);
             }
 
-            for (int k = 0; k < n; ++k) {
+            for (int k = 0; k < m; ++k) {
                 float s_k = 0.0f;
                 for (int i = 0; i < n; ++i) {
-                    s_k += Gamma[i * n + k];
+                    s_k += Gamma[i * m + k];
                 }
                 for (int i = 0; i < n; ++i) {
-                    Gamma_Y[i * n + k] = Gamma[i * n + k] - q[i * n + k] * s_k;
+                    Gamma_Y[i * m + k] = Gamma[i * m + k] - q[i * m + k] * s_k;
                 }
             }
 
-            // Row backward
-            for (int i = 0; i < n2; ++i) {
-                p[i] = safe_exp(Y_t[i]);
+            for (int idx = 0; idx < nm; ++idx) {
+                p[idx] = safe_exp(Y_t[idx]);
             }
 
             for (int i = 0; i < n; ++i) {
                 float t_i = 0.0f;
-                for (int k = 0; k < n; ++k) {
-                    t_i += Gamma_Y[i * n + k];
+                for (int k = 0; k < m; ++k) {
+                    t_i += Gamma_Y[i * m + k];
                 }
-                for (int k = 0; k < n; ++k) {
-                    Gamma[i * n + k] = Gamma_Y[i * n + k] - p[i * n + k] * t_i;
+                for (int k = 0; k < m; ++k) {
+                    Gamma[i * m + k] = Gamma_Y[i * m + k] - p[i * m + k] * t_i;
                 }
             }
         }
 
-        // Gradient w.r.t. log_alpha
-        for (int i = 0; i < n2; ++i) {
-            grad_out_b[i] = Gamma[i] / tau;
+        for (int idx = 0; idx < nm; ++idx) {
+            grad_out_b[idx] = Gamma[idx] / tau;
         }
 
-        // Gradient w.r.t. tau
         float grad_tau_b = 0.0f;
-        for (int i = 0; i < n2; ++i) {
-            grad_tau_b += Gamma[i] * log_alpha_b[i];
+        for (int idx = 0; idx < nm; ++idx) {
+            grad_tau_b += Gamma[idx] * log_alpha_b[idx];
         }
         grad_tau[b] = -grad_tau_b / (tau * tau);
     }
 }
 
-// =============================================================================
-// Sinkhorn Implicit Backward (CPU)
-// =============================================================================
-
 void sinkhorn_backward_implicit_cpu(
     const float* log_alpha,
     const float* P,
     const float* grad_P,
+    const float* log_a,
+    const float* log_b,
     float* grad_log_alpha,
     float* grad_tau,
-    int B, int n,
+    int B, int n, int m,
     float tau,
     int max_iters,
     float tol
 ) {
-    const int n2 = n * n;
+    const int nm = n * m;
 
-    std::vector<float> G(n2);
+    std::vector<float> G(nm);
     std::vector<float> lambda_(n);
-    std::vector<float> mu(n);
+    std::vector<float> mu(m);
 
     for (int b = 0; b < B; ++b) {
-        const float* log_alpha_b = log_alpha + b * n2;
-        const float* P_b = P + b * n2;
-        const float* grad_P_b = grad_P + b * n2;
-        float* grad_out_b = grad_log_alpha + b * n2;
+        const float* log_alpha_b = log_alpha + b * nm;
+        const float* P_b = P + b * nm;
+        const float* grad_P_b = grad_P + b * nm;
+        float* grad_out_b = grad_log_alpha + b * nm;
 
-        std::memcpy(G.data(), grad_P_b, n2 * sizeof(float));
+        std::memcpy(G.data(), grad_P_b, nm * sizeof(float));
         std::fill(lambda_.begin(), lambda_.end(), 0.0f);
         std::fill(mu.begin(), mu.end(), 0.0f);
 
-        // Iterate to solve adjoint system
         for (int iter = 0; iter < max_iters; ++iter) {
             float max_change = 0.0f;
 
-            // Update lambda
             for (int i = 0; i < n; ++i) {
                 float sum_PG = 0.0f;
                 float sum_P_mu = 0.0f;
-                for (int k = 0; k < n; ++k) {
-                    float p_ik = P_b[i * n + k];
-                    sum_PG += p_ik * G[i * n + k];
+                for (int k = 0; k < m; ++k) {
+                    float p_ik = P_b[i * m + k];
+                    sum_PG += p_ik * G[i * m + k];
                     sum_P_mu += p_ik * mu[k];
                 }
                 float new_lambda = sum_PG - sum_P_mu;
@@ -329,13 +289,12 @@ void sinkhorn_backward_implicit_cpu(
                 lambda_[i] = new_lambda;
             }
 
-            // Update mu
-            for (int k = 0; k < n; ++k) {
+            for (int k = 0; k < m; ++k) {
                 float sum_PG = 0.0f;
                 float sum_P_lambda = 0.0f;
                 for (int i = 0; i < n; ++i) {
-                    float p_ik = P_b[i * n + k];
-                    sum_PG += p_ik * G[i * n + k];
+                    float p_ik = P_b[i * m + k];
+                    sum_PG += p_ik * G[i * m + k];
                     sum_P_lambda += p_ik * lambda_[i];
                 }
                 float new_mu = sum_PG - sum_P_lambda;
@@ -348,18 +307,16 @@ void sinkhorn_backward_implicit_cpu(
             }
         }
 
-        // Compute gradient
         for (int i = 0; i < n; ++i) {
-            for (int k = 0; k < n; ++k) {
-                float centered = G[i * n + k] - lambda_[i] - mu[k];
-                grad_out_b[i * n + k] = P_b[i * n + k] * centered / tau;
+            for (int k = 0; k < m; ++k) {
+                float centered = G[i * m + k] - lambda_[i] - mu[k];
+                grad_out_b[i * m + k] = P_b[i * m + k] * centered / tau;
             }
         }
 
-        // Gradient w.r.t. tau
         float grad_tau_b = 0.0f;
-        for (int i = 0; i < n2; ++i) {
-            grad_tau_b += grad_out_b[i] * log_alpha_b[i];
+        for (int idx = 0; idx < nm; ++idx) {
+            grad_tau_b += grad_out_b[idx] * log_alpha_b[idx];
         }
         grad_tau[b] = -grad_tau_b / tau;
     }

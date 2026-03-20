@@ -22,10 +22,11 @@ namespace sinkhorn {
  *
  * Computes doubly-stochastic matrix from log_alpha via Sinkhorn iterations.
  *
- * @param log_alpha Input logits [B, n, n]
- * @param log_P Output matrix [B, n, n] (log-space if return_log, else probabilities)
+ * @param log_alpha Input logits [B, n, m]
+ * @param log_P Output matrix [B, n, m] (log-space if return_log, else probabilities)
  * @param B Batch size
- * @param n Matrix dimension (square)
+ * @param n Number of rows
+ * @param m Number of columns
  * @param tau Temperature parameter (must be positive)
  * @param n_iters Number of Sinkhorn iterations
  * @param return_log If true, return log-space result; else return probabilities
@@ -34,7 +35,9 @@ namespace sinkhorn {
 void sinkhorn_forward_cuda(
     const float* log_alpha,
     float* log_P,
-    int B, int n,
+    const float* log_a,
+    const float* log_b,
+    int B, int n, int m,
     float tau,
     int n_iters,
     bool return_log,
@@ -46,12 +49,13 @@ void sinkhorn_forward_cuda(
  *
  * Stores all intermediate values needed for exact gradient computation.
  *
- * @param log_alpha Input logits [B, n, n]
- * @param P Output probabilities [B, n, n]
- * @param log_X Intermediate values after column norm [B, T+1, n, n]
- * @param log_Y Intermediate values after row norm [B, T, n, n]
+ * @param log_alpha Input logits [B, n, m]
+ * @param P Output probabilities [B, n, m]
+ * @param log_X Intermediate values after column norm [B, T+1, n, m]
+ * @param log_Y Intermediate values after row norm [B, T, n, m]
  * @param B Batch size
- * @param n Matrix dimension
+ * @param n Number of rows
+ * @param m Number of columns
  * @param tau Temperature parameter
  * @param n_iters Number of iterations
  * @param stream CUDA stream
@@ -61,7 +65,9 @@ void sinkhorn_forward_with_intermediates_cuda(
     float* P,
     float* log_X,
     float* log_Y,
-    int B, int n,
+    const float* log_a,
+    const float* log_b,
+    int B, int n, int m,
     float tau,
     int n_iters,
     cudaStream_t stream = 0
@@ -73,15 +79,16 @@ void sinkhorn_forward_with_intermediates_cuda(
  * Computes exact gradients by backpropagating through all iterations.
  * Requires intermediate values from forward_with_intermediates.
  *
- * @param log_alpha Input logits [B, n, n]
- * @param P Output from forward [B, n, n]
- * @param grad_P Upstream gradient [B, n, n]
- * @param log_X Stored intermediates [B, T+1, n, n]
- * @param log_Y Stored intermediates [B, T, n, n]
- * @param grad_log_alpha Output gradient [B, n, n]
+ * @param log_alpha Input logits [B, n, m]
+ * @param P Output from forward [B, n, m]
+ * @param grad_P Upstream gradient [B, n, m]
+ * @param log_X Stored intermediates [B, T+1, n, m]
+ * @param log_Y Stored intermediates [B, T, n, m]
+ * @param grad_log_alpha Output gradient [B, n, m]
  * @param grad_tau Output gradient w.r.t. tau [B]
  * @param B Batch size
- * @param n Matrix dimension
+ * @param n Number of rows
+ * @param m Number of columns
  * @param tau Temperature parameter
  * @param n_iters Number of iterations
  * @param stream CUDA stream
@@ -92,9 +99,11 @@ void sinkhorn_backward_unrolled_cuda(
     const float* grad_P,
     const float* log_X,
     const float* log_Y,
+    const float* log_a,
+    const float* log_b,
     float* grad_log_alpha,
     float* grad_tau,
-    int B, int n,
+    int B, int n, int m,
     float tau,
     int n_iters,
     cudaStream_t stream = 0
@@ -106,13 +115,14 @@ void sinkhorn_backward_unrolled_cuda(
  * Memory-efficient gradient computation that doesn't require storing intermediates.
  * Uses fixed-point iteration to solve the adjoint system at convergence.
  *
- * @param log_alpha Input logits [B, n, n]
- * @param P Converged output [B, n, n]
- * @param grad_P Upstream gradient [B, n, n]
- * @param grad_log_alpha Output gradient [B, n, n]
+ * @param log_alpha Input logits [B, n, m]
+ * @param P Converged output [B, n, m]
+ * @param grad_P Upstream gradient [B, n, m]
+ * @param grad_log_alpha Output gradient [B, n, m]
  * @param grad_tau Output gradient w.r.t. tau [B]
  * @param B Batch size
- * @param n Matrix dimension
+ * @param n Number of rows
+ * @param m Number of columns
  * @param tau Temperature parameter
  * @param max_iters Max iterations for adjoint solve
  * @param stream CUDA stream
@@ -121,9 +131,11 @@ void sinkhorn_backward_implicit_cuda(
     const float* log_alpha,
     const float* P,
     const float* grad_P,
+    const float* log_a,
+    const float* log_b,
     float* grad_log_alpha,
     float* grad_tau,
-    int B, int n,
+    int B, int n, int m,
     float tau,
     int max_iters,
     cudaStream_t stream = 0
