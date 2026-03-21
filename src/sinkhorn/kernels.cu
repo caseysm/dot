@@ -14,6 +14,7 @@ namespace sinkhorn {
 
 constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = kSinkhornBlockSize;
+constexpr int SPECTRAL_BLOCK_SIZE = kSinkhornLargeBlockSize;
 constexpr int MAX_REDUCTION_BLOCK_SIZE = 1024;
 constexpr int MAX_REDUCTION_WARPS = MAX_REDUCTION_BLOCK_SIZE / WARP_SIZE;
 
@@ -67,6 +68,63 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
     return val;
 }
 
+__device__ __forceinline__ void center_vector(
+    float* vec,
+    int len,
+    float* shared,
+    float* scalar
+) {
+    float sum = 0.0f;
+    for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+        sum += vec[idx];
+    }
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        *scalar = block_sum / static_cast<float>(len);
+    }
+    __syncthreads();
+
+    float mean = *scalar;
+    for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+        vec[idx] -= mean;
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ float vector_norm(
+    float* vec,
+    int len,
+    float* shared,
+    float* scalar
+) {
+    float norm_sq = 0.0f;
+    for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+        float val = vec[idx];
+        norm_sq += val * val;
+    }
+    float block_norm_sq = block_reduce_sum(norm_sq, shared);
+    if (threadIdx.x == 0) {
+        *scalar = sqrtf(fmaxf(block_norm_sq, 1.0e-12f));
+    }
+    __syncthreads();
+    return *scalar;
+}
+
+__device__ __forceinline__ float center_and_normalize(
+    float* vec,
+    int len,
+    float* shared,
+    float* scalar
+) {
+    center_vector(vec, len, shared, scalar);
+    float norm = vector_norm(vec, len, shared, scalar);
+    for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+        vec[idx] /= norm;
+    }
+    __syncthreads();
+    return norm;
+}
+
 __global__ void sinkhorn_init_kernel(
     const float* __restrict__ log_alpha,
     float* __restrict__ log_P,
@@ -77,6 +135,108 @@ __global__ void sinkhorn_init_kernel(
 
     if (idx < total) {
         log_P[idx] = log_alpha[idx] * inv_tau;
+    }
+}
+
+__global__ void sinkhorn_spectral_preflight_kernel(
+    const float* __restrict__ log_alpha,
+    float* __restrict__ tau_estimates,
+    float* __restrict__ row_lse,
+    float* __restrict__ v_buf,
+    float* __restrict__ u_buf,
+    int B, int n, int m,
+    float inv_tau,
+    int n_power
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float scalar;
+
+    int b = blockIdx.x;
+    if (b >= B) return;
+
+    const float* log_alpha_b = log_alpha + b * n * m;
+    float* row_lse_b = row_lse + b * n;
+    float* v = v_buf + b * m;
+    float* u = u_buf + b * n;
+
+    // Precompute row logsumexp values once; each subsequent mat-vec reuses them.
+    for (int i = 0; i < n; ++i) {
+        const float* row = log_alpha_b + i * m;
+        float max_val = -FLT_MAX;
+        for (int j = threadIdx.x; j < m; j += blockDim.x) {
+            max_val = fmaxf(max_val, row[j] * inv_tau);
+        }
+        float row_max = block_reduce_max(max_val, shared);
+        if (threadIdx.x == 0) {
+            scalar = row_max;
+        }
+        __syncthreads();
+
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < m; j += blockDim.x) {
+            sum += safe_exp(row[j] * inv_tau - scalar);
+        }
+        float row_sum = block_reduce_sum(sum, shared);
+        if (threadIdx.x == 0) {
+            row_lse_b[i] = scalar + logf(fmaxf(row_sum, 1.0e-12f));
+        }
+        __syncthreads();
+    }
+
+    // Deterministic mean-zero initialization avoids host RNG setup.
+    for (int j = threadIdx.x; j < m; j += blockDim.x) {
+        v[j] = sinf(
+            static_cast<float>(j + 1) * 12.9898f +
+            static_cast<float>(b + 1) * 78.233f
+        );
+    }
+    __syncthreads();
+    center_and_normalize(v, m, shared, &scalar);
+
+    for (int power_iter = 0; power_iter < n_power; ++power_iter) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float* row = log_alpha_b + i * m;
+            float lse = row_lse_b[i];
+            float dot = 0.0f;
+            for (int j = 0; j < m; ++j) {
+                float weight = safe_exp(row[j] * inv_tau - lse);
+                dot += weight * v[j];
+            }
+            u[i] = dot;
+        }
+        __syncthreads();
+        center_vector(u, n, shared, &scalar);
+
+        for (int j = threadIdx.x; j < m; j += blockDim.x) {
+            float dot = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                const float* row = log_alpha_b + i * m;
+                float weight = safe_exp(row[j] * inv_tau - row_lse_b[i]);
+                dot += weight * u[i];
+            }
+            v[j] = dot;
+        }
+        __syncthreads();
+        center_and_normalize(v, m, shared, &scalar);
+    }
+
+    float tau_est = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float* row = log_alpha_b + i * m;
+        float lse = row_lse_b[i];
+        float dot = 0.0f;
+        for (int j = 0; j < m; ++j) {
+            float weight = safe_exp(row[j] * inv_tau - lse);
+            dot += weight * v[j];
+        }
+        u[i] = dot;
+    }
+    __syncthreads();
+    center_vector(u, n, shared, &scalar);
+    tau_est = vector_norm(u, n, shared, &scalar);
+
+    if (threadIdx.x == 0) {
+        tau_estimates[b] = fmaxf(0.0f, fminf(tau_est, 0.999999f));
     }
 }
 
@@ -340,6 +500,280 @@ __global__ void sinkhorn_col_norm_phase2_kernel(
     }
 }
 
+__global__ void sinkhorn_dual_row_update_kernel(
+    const float* __restrict__ log_K,
+    const float* __restrict__ log_v,
+    float* __restrict__ log_u,
+    const float* __restrict__ log_a,
+    int B, int n, int m
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_max;
+    __shared__ float s_lse;
+
+    int row_idx = blockIdx.x;
+    int b = row_idx / n;
+    int i = row_idx % n;
+
+    if (b >= B) return;
+
+    const float* row = log_K + b * n * m + i * m;
+    const float* v = log_v + b * m;
+
+    float max_val = -FLT_MAX;
+    for (int j = threadIdx.x; j < m; j += blockDim.x) {
+        max_val = fmaxf(max_val, row[j] + v[j]);
+    }
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_max = block_max;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < m; j += blockDim.x) {
+        sum += safe_exp(row[j] + v[j] - s_max);
+    }
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        float target = log_a != nullptr ? log_a[b * n + i] : -logf(static_cast<float>(n));
+        s_lse = target - (s_max + logf(fmaxf(block_sum, 1.0e-12f)));
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        log_u[b * n + i] = s_lse;
+    }
+}
+
+__global__ void sinkhorn_dual_row_update_phase1_kernel(
+    const float* __restrict__ log_K,
+    const float* __restrict__ log_v,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int B, int n, int m,
+    int chunks_per_row
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_max;
+
+    int row_idx = blockIdx.x / chunks_per_row;
+    int chunk_idx = blockIdx.x % chunks_per_row;
+    int b = row_idx / n;
+    int i = row_idx % n;
+
+    if (b >= B) return;
+
+    const float* row = log_K + b * n * m + i * m;
+    const float* v = log_v + b * m;
+    int j = chunk_idx * blockDim.x + threadIdx.x;
+
+    float max_val = (j < m) ? row[j] + v[j] : -FLT_MAX;
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_max = block_max;
+    __syncthreads();
+
+    float sum = (j < m) ? safe_exp(row[j] + v[j] - s_max) : 0.0f;
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        int partial_idx = row_idx * chunks_per_row + chunk_idx;
+        partial_max[partial_idx] = s_max;
+        partial_sum[partial_idx] = block_sum;
+    }
+}
+
+__global__ void sinkhorn_dual_row_update_phase2_kernel(
+    const float* __restrict__ log_a,
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    float* __restrict__ log_u,
+    int B, int n,
+    int chunks_per_row
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_global_max;
+    __shared__ float s_value;
+
+    int row_idx = blockIdx.x;
+    int b = row_idx / n;
+    int i = row_idx % n;
+
+    if (b >= B) return;
+
+    const float* row_partials_max = partial_max + row_idx * chunks_per_row;
+    const float* row_partials_sum = partial_sum + row_idx * chunks_per_row;
+
+    float max_val = -FLT_MAX;
+    for (int chunk = threadIdx.x; chunk < chunks_per_row; chunk += blockDim.x) {
+        max_val = fmaxf(max_val, row_partials_max[chunk]);
+    }
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_global_max = block_max;
+    __syncthreads();
+
+    float global_max = s_global_max;
+    float sum = 0.0f;
+    for (int chunk = threadIdx.x; chunk < chunks_per_row; chunk += blockDim.x) {
+        sum += row_partials_sum[chunk] * safe_exp(row_partials_max[chunk] - global_max);
+    }
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        float target = log_a != nullptr ? log_a[b * n + i] : -logf(static_cast<float>(n));
+        s_value = target - (global_max + logf(fmaxf(block_sum, 1.0e-12f)));
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        log_u[row_idx] = s_value;
+    }
+}
+
+__global__ void sinkhorn_dual_col_update_kernel(
+    const float* __restrict__ log_K,
+    const float* __restrict__ log_u,
+    float* __restrict__ log_v,
+    const float* __restrict__ log_b,
+    int B, int n, int m
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_max;
+    __shared__ float s_lse;
+
+    int col_idx = blockIdx.x;
+    int b = col_idx / m;
+    int j = col_idx % m;
+
+    if (b >= B) return;
+
+    const float* base = log_K + b * n * m + j;
+    const float* u = log_u + b * n;
+
+    float max_val = -FLT_MAX;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        max_val = fmaxf(max_val, base[i * m] + u[i]);
+    }
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_max = block_max;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        sum += safe_exp(base[i * m] + u[i] - s_max);
+    }
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        float target = log_b != nullptr ? log_b[b * m + j] : -logf(static_cast<float>(m));
+        s_lse = target - (s_max + logf(fmaxf(block_sum, 1.0e-12f)));
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        log_v[b * m + j] = s_lse;
+    }
+}
+
+__global__ void sinkhorn_dual_col_update_phase1_kernel(
+    const float* __restrict__ log_K,
+    const float* __restrict__ log_u,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int B, int n, int m,
+    int chunks_per_col
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_max;
+
+    int col_idx = blockIdx.x / chunks_per_col;
+    int chunk_idx = blockIdx.x % chunks_per_col;
+    int b = col_idx / m;
+    int j = col_idx % m;
+
+    if (b >= B) return;
+
+    const float* base = log_K + b * n * m + j;
+    const float* u = log_u + b * n;
+    int i = chunk_idx * blockDim.x + threadIdx.x;
+
+    float max_val = (i < n) ? base[i * m] + u[i] : -FLT_MAX;
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_max = block_max;
+    __syncthreads();
+
+    float sum = (i < n) ? safe_exp(base[i * m] + u[i] - s_max) : 0.0f;
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        int partial_idx = col_idx * chunks_per_col + chunk_idx;
+        partial_max[partial_idx] = s_max;
+        partial_sum[partial_idx] = block_sum;
+    }
+}
+
+__global__ void sinkhorn_dual_col_update_phase2_kernel(
+    const float* __restrict__ log_b,
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    float* __restrict__ log_v,
+    int B, int m,
+    int chunks_per_col
+) {
+    __shared__ float shared[MAX_REDUCTION_WARPS];
+    __shared__ float s_global_max;
+    __shared__ float s_value;
+
+    int col_idx = blockIdx.x;
+    int b = col_idx / m;
+    int j = col_idx % m;
+
+    if (b >= B) return;
+
+    const float* col_partials_max = partial_max + col_idx * chunks_per_col;
+    const float* col_partials_sum = partial_sum + col_idx * chunks_per_col;
+
+    float max_val = -FLT_MAX;
+    for (int chunk = threadIdx.x; chunk < chunks_per_col; chunk += blockDim.x) {
+        max_val = fmaxf(max_val, col_partials_max[chunk]);
+    }
+    float block_max = block_reduce_max(max_val, shared);
+    if (threadIdx.x == 0) s_global_max = block_max;
+    __syncthreads();
+
+    float global_max = s_global_max;
+    float sum = 0.0f;
+    for (int chunk = threadIdx.x; chunk < chunks_per_col; chunk += blockDim.x) {
+        sum += col_partials_sum[chunk] * safe_exp(col_partials_max[chunk] - global_max);
+    }
+    float block_sum = block_reduce_sum(sum, shared);
+    if (threadIdx.x == 0) {
+        float target = log_b != nullptr ? log_b[b * m + j] : -logf(static_cast<float>(m));
+        s_value = target - (global_max + logf(fmaxf(block_sum, 1.0e-12f)));
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        log_v[col_idx] = s_value;
+    }
+}
+
+__global__ void sinkhorn_dual_materialize_kernel(
+    const float* __restrict__ log_K,
+    const float* __restrict__ log_u,
+    const float* __restrict__ log_v,
+    float* __restrict__ output,
+    int B, int n, int m,
+    bool return_log
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * n * m;
+    if (idx >= total) return;
+
+    int nm = n * m;
+    int b = idx / nm;
+    int rem = idx % nm;
+    int i = rem / m;
+    int j = rem % m;
+
+    float log_p = log_K[idx] + log_u[b * n + i] + log_v[b * m + j];
+    output[idx] = return_log ? log_p : safe_exp(log_p);
+}
+
 __global__ void sinkhorn_exp_kernel(
     float* __restrict__ log_P,
     int total
@@ -385,6 +819,25 @@ __global__ void sinkhorn_copy_vec4_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total_vec4) {
         dst[idx] = src[idx];
+    }
+}
+
+__global__ void sinkhorn_max_abs_diff_kernel(
+    const float* __restrict__ lhs,
+    const float* __restrict__ rhs,
+    float* __restrict__ output,
+    int total
+) {
+    __shared__ float shared[BLOCK_SIZE / WARP_SIZE];
+
+    float local_max = 0.0f;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+        local_max = fmaxf(local_max, fabsf(lhs[idx] - rhs[idx]));
+    }
+
+    float block_max = block_reduce_max(local_max, shared);
+    if (threadIdx.x == 0) {
+        atomicMax(reinterpret_cast<unsigned int*>(output), __float_as_uint(block_max));
     }
 }
 
@@ -792,6 +1245,62 @@ inline void launch_col_norm(
     sinkhorn_col_norm_kernel<<<num_cols, col_block_size, 0, stream>>>(log_P, log_b, B, n, m);
 }
 
+inline void launch_dual_row_update(
+    const float* log_K,
+    const float* log_v,
+    float* log_u,
+    const float* log_a,
+    float* row_partial_max,
+    float* row_partial_sum,
+    int B, int n, int m,
+    int row_chunks,
+    cudaStream_t stream
+) {
+    int num_rows = B * n;
+    int row_block_size = sinkhorn_row_block_size(m);
+    if (row_chunks > 1) {
+        sinkhorn_dual_row_update_phase1_kernel<<<num_rows * row_chunks, row_block_size, 0, stream>>>(
+            log_K, log_v, row_partial_max, row_partial_sum, B, n, m, row_chunks
+        );
+        sinkhorn_dual_row_update_phase2_kernel<<<num_rows, row_block_size, 0, stream>>>(
+            log_a, row_partial_max, row_partial_sum, log_u, B, n, row_chunks
+        );
+        return;
+    }
+
+    sinkhorn_dual_row_update_kernel<<<num_rows, row_block_size, 0, stream>>>(
+        log_K, log_v, log_u, log_a, B, n, m
+    );
+}
+
+inline void launch_dual_col_update(
+    const float* log_K,
+    const float* log_u,
+    float* log_v,
+    const float* log_b,
+    float* col_partial_max,
+    float* col_partial_sum,
+    int B, int n, int m,
+    int col_chunks,
+    cudaStream_t stream
+) {
+    int num_cols = B * m;
+    int col_block_size = sinkhorn_col_block_size(n);
+    if (col_chunks > 1) {
+        sinkhorn_dual_col_update_phase1_kernel<<<num_cols * col_chunks, col_block_size, 0, stream>>>(
+            log_K, log_u, col_partial_max, col_partial_sum, B, n, m, col_chunks
+        );
+        sinkhorn_dual_col_update_phase2_kernel<<<num_cols, col_block_size, 0, stream>>>(
+            log_b, col_partial_max, col_partial_sum, log_v, B, m, col_chunks
+        );
+        return;
+    }
+
+    sinkhorn_dual_col_update_kernel<<<num_cols, col_block_size, 0, stream>>>(
+        log_K, log_u, log_v, log_b, B, n, m
+    );
+}
+
 void sinkhorn_forward_cuda(
     const float* log_alpha,
     float* log_P,
@@ -824,6 +1333,202 @@ void sinkhorn_forward_cuda(
     if (!return_log) {
         launch_exp(log_P, total, stream);
     }
+}
+
+void sinkhorn_dual_init_cuda(
+    const float* log_alpha,
+    float* log_K,
+    float* log_u,
+    float* log_v,
+    int B, int n, int m,
+    float tau,
+    cudaStream_t stream
+) {
+    if (tau <= 0.0f) return;
+
+    int total = B * n * m;
+    launch_init(log_alpha, log_K, total, 1.0f / tau, stream);
+    cudaMemsetAsync(log_u, 0, B * n * sizeof(float), stream);
+    cudaMemsetAsync(log_v, 0, B * m * sizeof(float), stream);
+}
+
+void sinkhorn_dual_rescale_cuda(
+    const float* log_alpha,
+    float* log_K,
+    int B, int n, int m,
+    float tau,
+    cudaStream_t stream
+) {
+    if (tau <= 0.0f) return;
+
+    int total = B * n * m;
+    launch_init(log_alpha, log_K, total, 1.0f / tau, stream);
+}
+
+void sinkhorn_dual_row_update_cuda(
+    const float* log_K,
+    const float* log_v,
+    float* log_u,
+    const float* log_a,
+    float* row_partial_max,
+    float* row_partial_sum,
+    int B, int n, int m,
+    int row_chunks,
+    cudaStream_t stream
+) {
+    launch_dual_row_update(
+        log_K,
+        log_v,
+        log_u,
+        log_a,
+        row_partial_max,
+        row_partial_sum,
+        B, n, m,
+        row_chunks,
+        stream
+    );
+}
+
+void sinkhorn_dual_col_update_cuda(
+    const float* log_K,
+    const float* log_u,
+    float* log_v,
+    const float* log_b,
+    float* col_partial_max,
+    float* col_partial_sum,
+    int B, int n, int m,
+    int col_chunks,
+    cudaStream_t stream
+) {
+    launch_dual_col_update(
+        log_K,
+        log_u,
+        log_v,
+        log_b,
+        col_partial_max,
+        col_partial_sum,
+        B, n, m,
+        col_chunks,
+        stream
+    );
+}
+
+void sinkhorn_dual_materialize_cuda(
+    const float* log_K,
+    const float* log_u,
+    const float* log_v,
+    float* output,
+    int B, int n, int m,
+    bool return_log,
+    cudaStream_t stream
+) {
+    int total = B * n * m;
+    int blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    sinkhorn_dual_materialize_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+        log_K, log_u, log_v, output, B, n, m, return_log
+    );
+}
+
+void sinkhorn_max_abs_diff_cuda(
+    const float* lhs,
+    const float* rhs,
+    float* output,
+    int total,
+    cudaStream_t stream
+) {
+    cudaMemsetAsync(output, 0, sizeof(float), stream);
+    int blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    blocks = blocks > 0 ? blocks : 1;
+    sinkhorn_max_abs_diff_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(lhs, rhs, output, total);
+}
+
+void sinkhorn_dual_forward_with_intermediates_cuda(
+    const float* log_alpha,
+    float* P,
+    float* log_K,
+    float* log_u_hist,
+    float* log_v_hist,
+    const float* log_a,
+    const float* log_b,
+    float* row_partial_max,
+    float* row_partial_sum,
+    float* col_partial_max,
+    float* col_partial_sum,
+    int B, int n, int m,
+    int row_chunks,
+    int col_chunks,
+    float tau,
+    int n_iters,
+    cudaStream_t stream
+) {
+    if (tau <= 0.0f) return;
+
+    int total_rows = B * n;
+    int total_cols = B * m;
+    float* log_u;
+    float* log_v;
+    cudaMalloc(&log_u, total_rows * sizeof(float));
+    cudaMalloc(&log_v, total_cols * sizeof(float));
+
+    sinkhorn_dual_init_cuda(log_alpha, log_K, log_u, log_v, B, n, m, tau, stream);
+
+    for (int t = 0; t < n_iters; ++t) {
+        sinkhorn_dual_row_update_cuda(
+            log_K,
+            log_v,
+            log_u,
+            log_a,
+            row_partial_max,
+            row_partial_sum,
+            B, n, m,
+            row_chunks,
+            stream
+        );
+        launch_copy(log_u, log_u_hist + t * total_rows, total_rows, stream);
+
+        sinkhorn_dual_col_update_cuda(
+            log_K,
+            log_u,
+            log_v,
+            log_b,
+            col_partial_max,
+            col_partial_sum,
+            B, n, m,
+            col_chunks,
+            stream
+        );
+        launch_copy(log_v, log_v_hist + t * total_cols, total_cols, stream);
+    }
+
+    sinkhorn_dual_materialize_cuda(log_K, log_u, log_v, P, B, n, m, /*return_log=*/false, stream);
+
+    cudaFree(log_u);
+    cudaFree(log_v);
+}
+
+void sinkhorn_spectral_preflight_cuda(
+    const float* log_alpha,
+    float* tau_estimates,
+    float* row_lse,
+    float* v_buf,
+    float* u_buf,
+    int B, int n, int m,
+    float tau,
+    int n_power,
+    cudaStream_t stream
+) {
+    if (tau <= 0.0f) return;
+
+    sinkhorn_spectral_preflight_kernel<<<B, SPECTRAL_BLOCK_SIZE, 0, stream>>>(
+        log_alpha,
+        tau_estimates,
+        row_lse,
+        v_buf,
+        u_buf,
+        B, n, m,
+        1.0f / tau,
+        n_power
+    );
 }
 
 void sinkhorn_forward_with_intermediates_cuda(
@@ -912,6 +1617,66 @@ void sinkhorn_backward_unrolled_cuda(
 
     cudaFree(Gamma);
     cudaFree(Gamma_Y);
+}
+
+void sinkhorn_backward_unrolled_dual_cuda(
+    const float* log_alpha,
+    const float* log_K,
+    const float* P,
+    const float* grad_P,
+    const float* log_u_hist,
+    const float* log_v_hist,
+    float* grad_log_alpha,
+    float* grad_tau,
+    int B, int n, int m,
+    float tau,
+    int n_iters,
+    cudaStream_t stream
+) {
+    int total = B * n * m;
+    int num_rows = B * n;
+    int num_cols = B * m;
+    int total_rows = B * n;
+    int total_cols = B * m;
+    float inv_tau = 1.0f / tau;
+    float neg_inv_tau2 = -1.0f / (tau * tau);
+
+    int blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    float* Gamma;
+    float* Gamma_Y;
+    float* log_X;
+    float* log_Y;
+    float* zero_v;
+    cudaMalloc(&Gamma, total * sizeof(float));
+    cudaMalloc(&Gamma_Y, total * sizeof(float));
+    cudaMalloc(&log_X, total * sizeof(float));
+    cudaMalloc(&log_Y, total * sizeof(float));
+    cudaMalloc(&zero_v, total_cols * sizeof(float));
+    cudaMemsetAsync(zero_v, 0, total_cols * sizeof(float), stream);
+
+    sinkhorn_backward_init_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(grad_P, P, Gamma, total);
+
+    for (int t = n_iters - 1; t >= 0; --t) {
+        const float* log_u_t = log_u_hist + t * total_rows;
+        const float* log_v_t = log_v_hist + t * total_cols;
+        const float* log_v_prev = (t > 0) ? (log_v_hist + (t - 1) * total_cols) : zero_v;
+
+        sinkhorn_dual_materialize_cuda(log_K, log_u_t, log_v_t, log_X, B, n, m, /*return_log=*/true, stream);
+        sinkhorn_dual_materialize_cuda(log_K, log_u_t, log_v_prev, log_Y, B, n, m, /*return_log=*/true, stream);
+
+        sinkhorn_backward_col_kernel<<<num_cols, BLOCK_SIZE, 0, stream>>>(Gamma, log_X, Gamma_Y, B, n, m);
+        sinkhorn_backward_row_kernel<<<num_rows, BLOCK_SIZE, 0, stream>>>(Gamma_Y, log_Y, Gamma, B, n, m);
+    }
+
+    sinkhorn_backward_final_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(Gamma, grad_log_alpha, inv_tau, total);
+    sinkhorn_backward_tau_kernel<<<B, BLOCK_SIZE, 0, stream>>>(Gamma, log_alpha, grad_tau, B, n, m, neg_inv_tau2);
+
+    cudaFree(Gamma);
+    cudaFree(Gamma_Y);
+    cudaFree(log_X);
+    cudaFree(log_Y);
+    cudaFree(zero_v);
 }
 
 void sinkhorn_backward_implicit_cuda(

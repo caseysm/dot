@@ -6,6 +6,7 @@
  */
 
 #include <torch/extension.h>
+#include <cmath>
 #include <vector>
 
 #include "common/torch_utils.h"
@@ -107,6 +108,81 @@ torch::Tensor sinkhorn_log_cpu_impl(
     );
 
     return log_P;
+}
+
+std::vector<torch::Tensor> sinkhorn_dual_forward_cpu_impl(
+    torch::Tensor log_alpha,
+    double tau,
+    int64_t n_iters,
+    double tol,
+    c10::optional<torch::Tensor> log_a,
+    c10::optional<torch::Tensor> log_b,
+    bool return_log,
+    int64_t method,
+    double omega,
+    int64_t anderson_k,
+    double mixing_beta,
+    double lr,
+    double beta1,
+    double beta2,
+    double eps_adam,
+    bool bias_correction,
+    double reg_start,
+    int64_t schedule
+) {
+    (void)tol;
+    (void)method;
+    (void)omega;
+    (void)anderson_k;
+    (void)mixing_beta;
+    (void)lr;
+    (void)beta1;
+    (void)beta2;
+    (void)eps_adam;
+    (void)bias_correction;
+    (void)reg_start;
+    (void)schedule;
+
+    auto result = return_log
+        ? sinkhorn_log_cpu_impl(log_alpha, tau, n_iters, log_a, log_b)
+        : sinkhorn_cpu_impl(log_alpha, tau, n_iters, log_a, log_b);
+    auto used_tensor = torch::tensor(n_iters, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto converged_tensor = torch::tensor(static_cast<int64_t>(tol <= 0.0), torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    return {result, used_tensor, converged_tensor};
+}
+
+torch::Tensor sinkhorn_spectral_preflight_cpu_impl(
+    torch::Tensor log_alpha,
+    double tau,
+    int64_t n_power
+) {
+    DOT_CHECK_INPUT_CPU(log_alpha);
+    TORCH_CHECK(log_alpha.dim() == 3, "log_alpha must be 3D [B, n, m]");
+    TORCH_CHECK(tau > 0.0, "tau must be > 0");
+    TORCH_CHECK(n_power >= 1, "n_power must be >= 1");
+
+    auto options = log_alpha.options().dtype(torch::kFloat32);
+    auto log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
+    auto log_K = log_alpha_f / static_cast<float>(tau);
+    auto log_P = log_K - at::logsumexp(log_K, std::vector<int64_t>{2}, true);
+    auto P = log_P.exp();
+
+    auto v = torch::randn({log_alpha.size(0), log_alpha.size(2)}, options);
+    v = v - v.mean(-1, true);
+    v = v / v.norm(2, -1, true).clamp_min(1.0e-12f);
+
+    torch::Tensor tau_est = torch::zeros({log_alpha.size(0)}, options);
+    for (int64_t iter = 0; iter < n_power; ++iter) {
+        auto u = torch::matmul(P, v.unsqueeze(-1)).squeeze(-1);
+        u = u - u.mean(-1, true);
+        u = u / u.norm(2, -1, true).clamp_min(1.0e-12f);
+        auto v_next = torch::matmul(P.transpose(-2, -1), u.unsqueeze(-1)).squeeze(-1);
+        v_next = v_next - v_next.mean(-1, true);
+        auto v_norm = v_next.norm(2, -1).clamp_min(1.0e-12f);
+        tau_est = v_norm;
+        v = v_next / v_norm.unsqueeze(-1);
+    }
+    return tau_est.clamp(0.0f, 0.999999f);
 }
 
 std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cpu_impl(
@@ -262,6 +338,8 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cpu_impl(
 TORCH_LIBRARY_IMPL(dot, CPU, m) {
     m.impl("sinkhorn", sinkhorn_cpu_impl);
     m.impl("sinkhorn_log", sinkhorn_log_cpu_impl);
+    m.impl("sinkhorn_dual_forward", sinkhorn_dual_forward_cpu_impl);
+    m.impl("sinkhorn_spectral_preflight", sinkhorn_spectral_preflight_cpu_impl);
     m.impl("sinkhorn_with_grads_unrolled", sinkhorn_with_grads_unrolled_cpu_impl);
     m.impl("sinkhorn_with_grads_implicit", sinkhorn_with_grads_implicit_cpu_impl);
 }

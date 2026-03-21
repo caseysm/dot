@@ -77,6 +77,142 @@ void sinkhorn_forward_cuda(
 );
 
 /**
+ * @brief Initialize dual-space Sinkhorn state on CUDA
+ *
+ * Computes log_K = log_alpha / tau once and zeros log_u/log_v.
+ */
+void sinkhorn_dual_init_cuda(
+    const float* log_alpha,
+    float* log_K,
+    float* log_u,
+    float* log_v,
+    int B, int n, int m,
+    float tau,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Recompute log_K = log_alpha / tau without touching log_u/log_v
+ */
+void sinkhorn_dual_rescale_cuda(
+    const float* log_alpha,
+    float* log_K,
+    int B, int n, int m,
+    float tau,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Dual-space row update: log_u = log_a - logsumexp(log_K + log_v)
+ */
+void sinkhorn_dual_row_update_cuda(
+    const float* log_K,
+    const float* log_v,
+    float* log_u,
+    const float* log_a,
+    float* row_partial_max,
+    float* row_partial_sum,
+    int B, int n, int m,
+    int row_chunks,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Dual-space column update: log_v = log_b - logsumexp(log_K + log_u)
+ */
+void sinkhorn_dual_col_update_cuda(
+    const float* log_K,
+    const float* log_u,
+    float* log_v,
+    const float* log_b,
+    float* col_partial_max,
+    float* col_partial_sum,
+    int B, int n, int m,
+    int col_chunks,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Materialize P = exp(log_u + log_K + log_v) or return log-space form
+ */
+void sinkhorn_dual_materialize_cuda(
+    const float* log_K,
+    const float* log_u,
+    const float* log_v,
+    float* output,
+    int B, int n, int m,
+    bool return_log,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Compute max(abs(lhs - rhs)) over a flat vector
+ */
+void sinkhorn_max_abs_diff_cuda(
+    const float* lhs,
+    const float* rhs,
+    float* output,
+    int total,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Dual-space forward with vector-history storage for unrolled backward
+ *
+ * Stores log_u/log_v after each iteration, requiring O(T * (n + m)) memory.
+ */
+void sinkhorn_dual_forward_with_intermediates_cuda(
+    const float* log_alpha,
+    float* P,
+    float* log_K,
+    float* log_u_hist,
+    float* log_v_hist,
+    const float* log_a,
+    const float* log_b,
+    float* row_partial_max,
+    float* row_partial_sum,
+    float* col_partial_max,
+    float* col_partial_sum,
+    int B, int n, int m,
+    int row_chunks,
+    int col_chunks,
+    float tau,
+    int n_iters,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Estimate Sinkhorn contraction via deflated power iteration
+ *
+ * Computes one spectral estimate per batch element without materializing the
+ * row-stochastic matrix explicitly. The kernel precomputes row logsumexp values
+ * once, then applies the deflated P and P^T operators in-place on vector buffers.
+ *
+ * @param log_alpha Input logits [B, n, m]
+ * @param tau_estimates Output contraction estimates [B]
+ * @param row_lse Row logsumexp scratch buffer [B, n]
+ * @param v_buf Right-vector scratch buffer [B, m]
+ * @param u_buf Left-vector scratch buffer [B, n]
+ * @param B Batch size
+ * @param n Number of rows
+ * @param m Number of columns
+ * @param tau Temperature parameter (must be positive)
+ * @param n_power Number of power iterations
+ * @param stream CUDA stream
+ */
+void sinkhorn_spectral_preflight_cuda(
+    const float* log_alpha,
+    float* tau_estimates,
+    float* row_lse,
+    float* v_buf,
+    float* u_buf,
+    int B, int n, int m,
+    float tau,
+    int n_power,
+    cudaStream_t stream = 0
+);
+
+/**
  * @brief Forward pass with intermediate storage for unrolled backward
  *
  * Stores all intermediate values needed for exact gradient computation.
@@ -139,6 +275,27 @@ void sinkhorn_backward_unrolled_cuda(
     const float* log_Y,
     const float* log_a,
     const float* log_b,
+    float* grad_log_alpha,
+    float* grad_tau,
+    int B, int n, int m,
+    float tau,
+    int n_iters,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Unrolled backward pass using dual-state histories
+ *
+ * Reconstructs the per-iteration normalized matrices on the fly from stored
+ * log_u/log_v histories, keeping storage at O(T * (n + m)).
+ */
+void sinkhorn_backward_unrolled_dual_cuda(
+    const float* log_alpha,
+    const float* log_K,
+    const float* P,
+    const float* grad_P,
+    const float* log_u_hist,
+    const float* log_v_hist,
     float* grad_log_alpha,
     float* grad_tau,
     int B, int n, int m,

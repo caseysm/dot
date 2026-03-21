@@ -1,5 +1,6 @@
 """Tests for Sinkhorn optimal transport."""
 
+import math
 import pytest
 import torch
 from unittest import mock
@@ -72,6 +73,39 @@ def _vanilla_convergence_iters(
             return it + 1
         u, v = u_next, v_next
     return max_iters
+
+
+def _easy_validation_cost(
+    n: int,
+    device: torch.device | str,
+    scale: float = 0.1,
+    seed: int = 0,
+) -> torch.Tensor:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    return scale * torch.randn((1, n, n), device=device, generator=gen).abs()
+
+
+def _moderate_validation_cost(
+    n: int,
+    device: torch.device | str,
+    scale: float = 0.005,
+    seed: int = 0,
+) -> torch.Tensor:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    x = torch.randn((n, 2), device=device, generator=gen)
+    y = torch.randn((n, 2), device=device, generator=gen)
+    return (scale * torch.cdist(x, y, p=2).square()).unsqueeze(0)
+
+
+def _hard_validation_cost(
+    n: int,
+    device: torch.device | str,
+    scale: float,
+) -> torch.Tensor:
+    x = torch.linspace(-1.0, 1.0, n, device=device).unsqueeze(1)
+    return (scale * torch.cdist(x, x, p=2).square()).unsqueeze(0)
 
 
 def _assert_marginals(plan: torch.Tensor, a: torch.Tensor, b: torch.Tensor, atol: float = 1e-3):
@@ -752,3 +786,126 @@ def test_sinkhorn_cuda_very_large_square_preserves_marginals():
 
     assert torch.isfinite(result.transport_plan).all()
     _assert_marginals(result.transport_plan, uniform, uniform, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_cuda_dual_matches_full_matrix_fixed_iterations():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 96, 128, device="cuda")
+
+    dual = dot.sinkhorn(cost, reg=0.1, n_iters=50, tol=0, dual=True)
+    full = dot.sinkhorn(cost, reg=0.1, n_iters=50, tol=0, dual=False)
+
+    assert dual.n_iters_used == 50
+    assert full.n_iters_used == 50
+    assert torch.allclose(dual.transport_plan, full.transport_plan, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_cuda_dual_unrolled_matches_full_matrix_fixed_iterations():
+    import dot
+
+    torch.manual_seed(0)
+    dual_cost = torch.rand(1, 48, 64, device="cuda", requires_grad=True)
+    full_cost = dual_cost.detach().clone().requires_grad_(True)
+
+    dual = dot.sinkhorn(dual_cost, reg=0.1, n_iters=30, tol=0, dual=True, backward_mode="unrolled")
+    full = dot.sinkhorn(full_cost, reg=0.1, n_iters=30, tol=0, dual=False, backward_mode="unrolled")
+
+    dual.cost.sum().backward()
+    full.cost.sum().backward()
+
+    assert dual.n_iters_used == 30
+    assert full.n_iters_used == 30
+    assert torch.allclose(dual.transport_plan, full.transport_plan, atol=1e-5)
+    assert torch.allclose(dual_cost.grad, full_cost.grad, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_cuda_convergence_reduces_iterations():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 256, 256, device="cuda")
+
+    early = dot.sinkhorn(cost, reg=0.1, n_iters=50)
+    fixed = dot.sinkhorn(cost, reg=0.1, n_iters=50, tol=0)
+
+    assert early.n_iters_used is not None
+    assert early.n_iters_used < 50
+    assert fixed.n_iters_used == 50
+    assert torch.allclose(early.transport_plan, fixed.transport_plan, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_spectral_preflight_returns_per_batch_predictions():
+    import dot
+
+    cost = torch.cat(
+        [
+            _easy_validation_cost(64, "cuda", scale=0.1, seed=0),
+            _easy_validation_cost(64, "cuda", scale=0.2, seed=1),
+        ],
+        dim=0,
+    )
+
+    predicted = dot.spectral_preflight(-cost, 0.1, tol=1e-6)
+
+    assert isinstance(predicted, torch.Tensor)
+    assert predicted.shape == (2,)
+    assert predicted.dtype == torch.int64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_spectral_preflight_validation_matrix():
+    import dot
+
+    cases = [
+        ("easy", 1.0, 100, lambda: _easy_validation_cost(100, "cuda", scale=0.1, seed=0)),
+        ("easy", 0.1, 500, lambda: _easy_validation_cost(500, "cuda", scale=0.1, seed=0)),
+        ("moderate", 0.01, 500, lambda: _moderate_validation_cost(500, "cuda", scale=0.005, seed=0)),
+        ("hard", 0.001, 500, lambda: _hard_validation_cost(500, "cuda", scale=0.18)),
+        ("easy", 0.1, 2000, lambda: _easy_validation_cost(2000, "cuda", scale=0.1, seed=0)),
+        ("moderate", 0.01, 2000, lambda: _moderate_validation_cost(2000, "cuda", scale=0.005, seed=0)),
+        ("hard", 0.001, 2000, lambda: _hard_validation_cost(2000, "cuda", scale=0.25)),
+    ]
+
+    conservative = 0
+    within_2x = 0
+    failures: list[str] = []
+    for label, eps, n, factory in cases:
+        cost = factory()
+        predicted = dot.spectral_preflight(-cost, eps, tol=1e-6)
+        predicted_iters = int(predicted.max().item()) if torch.is_tensor(predicted) else int(predicted)
+        actual_iters = dot.sinkhorn(cost, reg=eps, n_iters=400, tol=1e-6).n_iters_used
+        ratio = predicted_iters / actual_iters
+        if predicted_iters >= actual_iters:
+            conservative += 1
+        else:
+            failures.append(f"{label} eps={eps} n={n} predicted={predicted_iters} actual={actual_iters}")
+        if predicted_iters <= 2 * actual_iters:
+            within_2x += 1
+        else:
+            failures.append(f"{label} eps={eps} n={n} ratio={ratio:.2f}")
+
+    assert conservative >= math.ceil(0.95 * len(cases)), failures
+    assert within_2x >= math.ceil(0.90 * len(cases)), failures
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_auto_matches_converged_solution():
+    import dot
+
+    cost = _moderate_validation_cost(256, "cuda", scale=0.005, seed=0)
+    predicted = dot.spectral_preflight(-cost, 0.01, tol=1e-6)
+    predicted_iters = int(predicted.max().item()) if torch.is_tensor(predicted) else int(predicted)
+    auto = dot.sinkhorn(cost, reg=0.01, n_iters="auto", tol=1e-6)
+    converged = dot.sinkhorn(cost, reg=0.01, n_iters=400, tol=1e-6)
+
+    assert auto.n_iters_used is not None
+    assert converged.n_iters_used is not None
+    assert predicted_iters >= converged.n_iters_used
+    assert auto.n_iters_used <= predicted_iters
+    assert torch.allclose(auto.transport_plan, converged.transport_plan, atol=2e-3)

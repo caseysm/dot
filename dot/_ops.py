@@ -72,6 +72,8 @@ dot = torch.ops.dot
 # Wrapped operator access - Sinkhorn
 sinkhorn = torch.ops.dot.sinkhorn
 sinkhorn_log = torch.ops.dot.sinkhorn_log
+sinkhorn_dual_forward = torch.ops.dot.sinkhorn_dual_forward
+sinkhorn_spectral_preflight = torch.ops.dot.sinkhorn_spectral_preflight
 sinkhorn_with_grads_unrolled = torch.ops.dot.sinkhorn_with_grads_unrolled
 sinkhorn_with_grads_implicit = torch.ops.dot.sinkhorn_with_grads_implicit
 

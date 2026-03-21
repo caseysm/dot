@@ -8,6 +8,8 @@
  * API:
  *   - sinkhorn(log_alpha, tau, n_iters) -> P
  *   - sinkhorn_log(log_alpha, tau, n_iters) -> log(P)
+ *   - sinkhorn_dual_forward(log_alpha, tau, n_iters, tol, ...) -> [P_or_logP, n_iters_used, converged]
+ *   - sinkhorn_spectral_preflight(log_alpha, tau, n_power) -> tau_estimates
  *   - sinkhorn_with_grads_unrolled(log_alpha, grad_P, tau, n_iters) -> [P, grad_log_alpha, grad_tau]
  *   - sinkhorn_with_grads_implicit(log_alpha, grad_P, tau, n_iters, backward_iters) -> [P, grad_log_alpha, grad_tau]
  */
@@ -30,6 +32,20 @@ TORCH_LIBRARY_FRAGMENT(dot, m) {
 
     // Log-space forward: return log(P) for numerical stability
     m.def("sinkhorn_log(Tensor log_alpha, float tau, int n_iters, Tensor? log_a=None, Tensor? log_b=None) -> Tensor");
+
+    // Dual-space forward with optional convergence checking and acceleration.
+    // Returns [P_or_logP, n_iters_used, converged]
+    m.def(
+        "sinkhorn_dual_forward("
+        "Tensor log_alpha, float tau, int n_iters, float tol=0.0, Tensor? log_a=None, Tensor? log_b=None, "
+        "bool return_log=False, int method=0, float omega=1.5, int anderson_k=5, float mixing_beta=1.0, "
+        "float lr=1.0, float beta1=0.9, float beta2=0.999, float eps_adam=1e-8, bool bias_correction=True, "
+        "float reg_start=-1.0, int schedule=0"
+        ") -> Tensor[]"
+    );
+
+    // Spectral preflight returns one contraction estimate per batch element.
+    m.def("sinkhorn_spectral_preflight(Tensor log_alpha, float tau, int n_power=8) -> Tensor");
 
     // Forward + backward with unrolled differentiation through iterations
     // Returns [P, grad_log_alpha, grad_tau]

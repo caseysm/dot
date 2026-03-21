@@ -36,6 +36,7 @@ from . import _ops
 from .sinkhorn import (
     sinkhorn,
     sinkhorn_from_scores,
+    spectral_preflight,
     SinkhornResult,
     Sinkhorn,
     SinkhornFromScores,
@@ -52,6 +53,7 @@ __all__ = [
     # Sinkhorn API
     'sinkhorn',
     'sinkhorn_from_scores',
+    'spectral_preflight',
     'SinkhornResult',
     'Sinkhorn',
     'SinkhornFromScores',
