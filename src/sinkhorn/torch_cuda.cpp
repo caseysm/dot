@@ -51,6 +51,12 @@ torch::Tensor sinkhorn_cuda_impl(
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
     torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
     torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
+    int row_chunks = dot::sinkhorn::sinkhorn_row_chunks(m);
+    int col_chunks = dot::sinkhorn::sinkhorn_col_chunks(n);
+    torch::Tensor row_partial_max = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor row_partial_sum = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_max = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_sum = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     dot::sinkhorn::sinkhorn_forward_cuda(
@@ -58,7 +64,13 @@ torch::Tensor sinkhorn_cuda_impl(
         P.data_ptr<float>(),
         log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
         log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_max.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_sum.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_max.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_sum.data_ptr<float>() : nullptr,
         B, n, m,
+        row_chunks,
+        col_chunks,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/false,
@@ -98,6 +110,12 @@ torch::Tensor sinkhorn_log_cuda_impl(
     torch::Tensor log_alpha_f = log_alpha.to(torch::kFloat32).contiguous();
     torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
     torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
+    int row_chunks = dot::sinkhorn::sinkhorn_row_chunks(m);
+    int col_chunks = dot::sinkhorn::sinkhorn_col_chunks(n);
+    torch::Tensor row_partial_max = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor row_partial_sum = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_max = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_sum = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     dot::sinkhorn::sinkhorn_forward_cuda(
@@ -105,7 +123,13 @@ torch::Tensor sinkhorn_log_cuda_impl(
         log_P.data_ptr<float>(),
         log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
         log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_max.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_sum.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_max.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_sum.data_ptr<float>() : nullptr,
         B, n, m,
+        row_chunks,
+        col_chunks,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/true,
@@ -151,6 +175,12 @@ std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cuda_impl(
     torch::Tensor grad_P_f = grad_P.to(torch::kFloat32).contiguous();
     torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
     torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
+    int row_chunks = dot::sinkhorn::sinkhorn_row_chunks(m);
+    int col_chunks = dot::sinkhorn::sinkhorn_col_chunks(n);
+    torch::Tensor row_partial_max = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor row_partial_sum = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_max = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_sum = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
 
     // Allocate intermediates
     torch::Tensor log_X = torch::empty({B, n_iters + 1, n, m}, options);
@@ -166,7 +196,13 @@ std::vector<torch::Tensor> sinkhorn_with_grads_unrolled_cuda_impl(
         log_Y.data_ptr<float>(),
         log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
         log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_max.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_sum.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_max.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_sum.data_ptr<float>() : nullptr,
         B, n, m,
+        row_chunks,
+        col_chunks,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         stream
@@ -230,6 +266,12 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
     torch::Tensor grad_P_f = grad_P.to(torch::kFloat32).contiguous();
     torch::Tensor log_a_f = log_a.has_value() ? log_a->to(torch::kFloat32).contiguous() : torch::Tensor();
     torch::Tensor log_b_f = log_b.has_value() ? log_b->to(torch::kFloat32).contiguous() : torch::Tensor();
+    int row_chunks = dot::sinkhorn::sinkhorn_row_chunks(m);
+    int col_chunks = dot::sinkhorn::sinkhorn_col_chunks(n);
+    torch::Tensor row_partial_max = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor row_partial_sum = row_chunks > 1 ? torch::empty({B * n, row_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_max = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
+    torch::Tensor col_partial_sum = col_chunks > 1 ? torch::empty({B * m, col_chunks}, options) : torch::Tensor();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -239,7 +281,13 @@ std::vector<torch::Tensor> sinkhorn_with_grads_implicit_cuda_impl(
         P.data_ptr<float>(),
         log_a.has_value() ? log_a_f.data_ptr<float>() : nullptr,
         log_b.has_value() ? log_b_f.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_max.data_ptr<float>() : nullptr,
+        row_chunks > 1 ? row_partial_sum.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_max.data_ptr<float>() : nullptr,
+        col_chunks > 1 ? col_partial_sum.data_ptr<float>() : nullptr,
         B, n, m,
+        row_chunks,
+        col_chunks,
         static_cast<float>(tau),
         static_cast<int>(n_iters),
         /*return_log=*/false,

@@ -17,6 +17,32 @@
 namespace dot {
 namespace sinkhorn {
 
+constexpr int kSinkhornBlockSize = 256;
+constexpr int kSinkhornLargeBlockSize = 1024;
+constexpr int kSinkhornAdaptiveBlockThreshold = 512;
+
+inline int sinkhorn_row_block_size(int m) {
+    return (m > kSinkhornAdaptiveBlockThreshold && m <= kSinkhornLargeBlockSize)
+        ? kSinkhornLargeBlockSize
+        : kSinkhornBlockSize;
+}
+
+inline int sinkhorn_col_block_size(int n) {
+    return (n > kSinkhornAdaptiveBlockThreshold && n <= kSinkhornLargeBlockSize)
+        ? kSinkhornLargeBlockSize
+        : kSinkhornBlockSize;
+}
+
+inline int sinkhorn_row_chunks(int m) {
+    int block_size = sinkhorn_row_block_size(m);
+    return (m + block_size - 1) / block_size;
+}
+
+inline int sinkhorn_col_chunks(int n) {
+    int block_size = sinkhorn_col_block_size(n);
+    return (n + block_size - 1) / block_size;
+}
+
 /**
  * @brief Forward pass of Sinkhorn algorithm on CUDA
  *
@@ -37,7 +63,13 @@ void sinkhorn_forward_cuda(
     float* log_P,
     const float* log_a,
     const float* log_b,
+    float* row_partial_max,
+    float* row_partial_sum,
+    float* col_partial_max,
+    float* col_partial_sum,
     int B, int n, int m,
+    int row_chunks,
+    int col_chunks,
     float tau,
     int n_iters,
     bool return_log,
@@ -67,7 +99,13 @@ void sinkhorn_forward_with_intermediates_cuda(
     float* log_Y,
     const float* log_a,
     const float* log_b,
+    float* row_partial_max,
+    float* row_partial_sum,
+    float* col_partial_max,
+    float* col_partial_sum,
     int B, int n, int m,
+    int row_chunks,
+    int col_chunks,
     float tau,
     int n_iters,
     cudaStream_t stream = 0

@@ -724,3 +724,31 @@ def test_muon_backward_works():
     result.cost.sum().backward()
 
     assert cost.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_cuda_large_rectangular_matches_reference():
+    import dot
+
+    torch.manual_seed(0)
+    cost = torch.rand(1, 320, 640, device="cuda")
+
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=50)
+    ref = _reference_from_scores(-cost, tau=0.1, n_iters=50)
+
+    assert torch.allclose(result.transport_plan, ref, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sinkhorn_cuda_very_large_square_preserves_marginals():
+    import dot
+
+    torch.manual_seed(0)
+    n = 1300
+    cost = torch.rand(1, n, n, device="cuda")
+
+    result = dot.sinkhorn(cost, reg=0.1, n_iters=50)
+    uniform = _uniform(1, n, cost.device, cost.dtype)
+
+    assert torch.isfinite(result.transport_plan).all()
+    _assert_marginals(result.transport_plan, uniform, uniform, atol=2e-3)
